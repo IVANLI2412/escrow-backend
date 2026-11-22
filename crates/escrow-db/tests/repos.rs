@@ -405,6 +405,57 @@ async fn duplicate_diffs_and_review_ranking_inputs(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn a_bounty_has_at_most_one_open_dispute(pool: PgPool) {
+    seed_repo(&pool).await;
+    bounty(&pool, 4, 3, 100, 14).await;
+    bounty(&pool, 5, 4, 100, 14).await;
+
+    let first = match disputes::create_if_none_open(&pool, 4, 500, "one").await.unwrap() {
+        disputes::NewDispute::Created(d) => d,
+        other => panic!("expected a new dispute, got {other:?}"),
+    };
+    match disputes::create_if_none_open(&pool, 4, 900, "two").await.unwrap() {
+        disputes::NewDispute::AlreadyOpen(d) => assert_eq!((d.id.as_str(), d.reason.as_str()), (first.id.as_str(), "one")),
+        other => panic!("expected the existing dispute, got {other:?}"),
+    }
+    assert_eq!(disputes::open_for_bounty(&pool, 4).await.unwrap().unwrap().id, first.id);
+    assert_eq!(disputes::count_open(&pool).await.unwrap(), 1);
+
+    // the database itself refuses a second open row, not only this function
+    assert!(disputes::create(&pool, 4, 900, "sneaky").await.is_err());
+
+    // other bounties are unaffected
+    assert!(matches!(disputes::create_if_none_open(&pool, 5, 500, "other").await.unwrap(), disputes::NewDispute::Created(_)));
+    assert_eq!(disputes::count_open(&pool).await.unwrap(), 2);
+
+    // an opened-on-chain dispute still counts as open; a resolved one does not
+    disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+    assert!(matches!(disputes::create_if_none_open(&pool, 4, 500, "again").await.unwrap(), disputes::NewDispute::AlreadyOpen(_)));
+    disputes::mark_resolved(&pool, 4).await.unwrap();
+    assert!(disputes::open_for_bounty(&pool, 4).await.unwrap().is_none());
+    assert!(matches!(disputes::create_if_none_open(&pool, 4, 500, "new round").await.unwrap(), disputes::NewDispute::Created(_)));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn concurrent_dispute_requests_create_exactly_one_row(pool: PgPool) {
+    seed_repo(&pool).await;
+    bounty(&pool, 4, 3, 100, 14).await;
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            let pool = pool.clone();
+            tokio::spawn(async move { disputes::create_if_none_open(&pool, 4, 500 + i, "race").await.unwrap() })
+        })
+        .collect();
+    let mut created = 0;
+    for t in tasks {
+        if matches!(t.await.unwrap(), disputes::NewDispute::Created(_)) {
+            created += 1;
+        }
+    }
+    assert_eq!((created, disputes::count_open(&pool).await.unwrap()), (1, 1));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn dispute_lifecycle_follows_chain_events(pool: PgPool) {
     seed_repo(&pool).await;
     bounty(&pool, 4, 3, 100, 14).await;
