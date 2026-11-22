@@ -112,6 +112,21 @@ cargo +nightly fuzz run --fuzz-dir crates/escrow-chain/fuzz decode_event
 cargo +nightly fuzz run --fuzz-dir crates/escrow-chain/fuzz decode_scval
 ```
 
+## Contract errors
+
+`CONTRACT_ERRORS` in `crates/escrow-core/src/contract_errors.rs` mirrors the contract's `errors.rs` by hand. To catch drift, that file is vendored in `crates/escrow-core/tests/fixtures/` at a pinned commit of `Soroban-escrow/escrow-contracts` (`bounty_escrow_errors.commit`), and the `contract_errors_sync` test compares codes and names. On a mismatch the test (and so CI) fails with a diff of missing, renamed and extra codes.
+
+When the contract changes its errors:
+
+```bash
+scripts/sync-contract-errors.sh [<commit-sha>]   # default: head of the contracts repo; needs `gh`
+# edit CONTRACT_ERRORS (code, name, friendly message) until this passes:
+cargo test -p escrow-core --test contract_errors_sync
+```
+
+Commit the updated fixture files together with the table change. The test needs no network.
+
+>>>>>>> 7461cc4 (ci(contract-errors): check the error table against a pinned escrow-contracts errors.rs (Closes #195))
 ## Conventions
 
 - `cargo fmt` (config in `rustfmt.toml`), clippy clean with `-D warnings`, no `unsafe`.
