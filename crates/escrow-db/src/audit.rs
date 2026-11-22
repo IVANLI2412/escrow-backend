@@ -1,4 +1,7 @@
 //! Append-only audit trail. It also serves as the "already sent" memory for reminders and announcements.
+//!
+//! Rows are hash-chained by the `audit_log_chain` trigger (migration 0008): each row stores
+//! `seq`, `prev_hash` and `hash`. Use [`verify`] to walk the chain.
 
 use chrono::{DateTime, Utc};
 use crate::new_id;
@@ -44,4 +47,22 @@ pub async fn count_anomalies_24h<'e>(ex: impl PgExecutor<'e>) -> Result<i64, sql
     )
     .fetch_one(ex)
     .await
+}
+
+/// The first row where the chain is broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokenLink {
+    pub seq: i64,
+    pub id: String,
+    pub reason: String,
+}
+
+/// Walks the chain from `from_seq` (1 for the whole table) and returns the first broken link, if any.
+/// Verification runs inside Postgres via `audit_verify()`, so it needs no hashing crate.
+pub async fn verify<'e>(ex: impl PgExecutor<'e>, from_seq: i64) -> Result<Option<BrokenLink>, sqlx::Error> {
+    let row: Option<(i64, String, String)> = sqlx::query_as("SELECT broken_seq, broken_id, reason FROM audit_verify($1)")
+        .bind(from_seq)
+        .fetch_optional(ex)
+        .await?;
+    Ok(row.map(|(seq, id, reason)| BrokenLink { seq, id, reason }))
 }
