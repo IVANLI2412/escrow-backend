@@ -168,6 +168,17 @@ impl<'a> Reader<'a> {
             }),
         }
     }
+    /// Like [`Self::number`], but an unset variable stays `None` instead of taking a default.
+    fn optional_number<T: FromStr>(&mut self, k: &str) -> Option<T> {
+        let v = self.raw(k)?;
+        match v.parse() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.errors.push(format!("{k}: `{v}` is not a valid number"));
+                None
+            }
+        }
+    }
     fn url(&mut self, k: &str, default: Option<&str>) -> String {
         let v = match (self.raw(k), default) {
             (Some(v), _) => v.to_string(),
@@ -387,7 +398,7 @@ impl Config {
             review_debounce_secs: r.number("REVIEW_DEBOUNCE_SECS", 300u64),
             trust_proxy: matches!(r.raw("TRUST_PROXY"), Some("1" | "true")),
             metrics_token: r.optional("METRICS_TOKEN"),
-            indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
+            indexer_start_ledger: r.optional_number("INDEXER_START_LEDGER"),
             db_max_connections: r.number("DB_MAX_CONNECTIONS", 10u32),
             worker_concurrency: r.number("WORKER_CONCURRENCY", 4usize),
             shared_rate_limits,
@@ -586,5 +597,21 @@ mod tests {
     fn ai_pricing_must_be_positive() {
         let e = Config::from_map(&with(&[("AI_PRICE_INPUT_PER_MTOK", "0")])).unwrap_err().to_string();
         assert!(e.contains("must be positive"));
+    }
+
+    #[test]
+    fn indexer_start_ledger_is_optional_and_numeric() {
+        assert_eq!(Config::from_map(&base()).unwrap().indexer_start_ledger, None);
+        assert_eq!(Config::from_map(&with(&[("INDEXER_START_LEDGER", " 123456 ")])).unwrap().indexer_start_ledger, Some(123_456));
+        // blank counts as unset, like every other variable
+        assert_eq!(Config::from_map(&with(&[("INDEXER_START_LEDGER", "  ")])).unwrap().indexer_start_ledger, None);
+    }
+
+    #[test]
+    fn a_non_numeric_indexer_start_ledger_is_a_config_error() {
+        for bad in ["12o45", "-5", "1.5", "latest", "4294967296"] {
+            let e = Config::from_map(&with(&[("INDEXER_START_LEDGER", bad)])).unwrap_err().to_string();
+            assert!(e.contains(&format!("INDEXER_START_LEDGER: `{bad}` is not a valid number")), "{bad}: {e}");
+        }
     }
 }

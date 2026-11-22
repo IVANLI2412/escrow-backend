@@ -38,7 +38,7 @@ Secrets never appear in logs or `Debug` output.
 | `TOKEN_XLM_CONTRACT_ID`, `TOKEN_USDC_CONTRACT_ID` | empty | The token contracts bounties can be paid in. **Leave one empty to disable that token** (`/bounty … USDC` is then refused with a clear message). On testnet, the native XLM token's contract id is the Stellar Asset Contract for native; USDC needs a verified issuer's contract. |
 | `TOKEN_MIN_AMOUNT`, `TOKEN_MAX_AMOUNT` | `1`, `500` | Per-bounty limits **in whole tokens**, enforced when parsing `/bounty`. The contract enforces its own (authoritative) limits too. |
 | `MIN_DAYS`, `MAX_DAYS` | `1`, `90` | Allowed bounty duration. |
-| `INDEXER_START_LEDGER` | none | Where a brand-new database starts reading events. Best: the contract's deployment ledger. |
+| `INDEXER_START_LEDGER` | none | Where a brand-new database starts reading events. Best: the contract's deployment ledger. Must be a whole number (a ledger sequence, `0`–`4294967295`); anything else, such as `12o45`, is a start-up error rather than being ignored. |
 | `INDEXER_LOOKBACK_LEDGERS` | `1000` | If no start ledger: begin this many ledgers behind the tip. |
 | `INDEXER_INTERVAL_SECS` | `5` | Poll interval. |
 | `EXPLORER_TX_URL_TEMPLATE` | by network | Must contain `{hash}`. Used in "Paid …" comments. |
