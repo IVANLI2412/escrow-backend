@@ -26,11 +26,16 @@ fn badge(s: BountyStatus) -> &'static str {
 }
 
 /// Escapes markdown/HTML-significant characters in untrusted text and flattens newlines.
+///
+/// Beyond the per-character escapes, two GitHub autolinks are broken up: `&` is escaped so entities such
+/// as `&lt;` render as text, `://` in a URL gets its colon escaped, and `www.` gets its dot escaped, so
+/// bare URLs are not linked.
+/// `owner/repo#123` and `#123` are neutralised by escaping the `#`.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '(' | ')' | '#' | '+' | '!' | '|' | '~' | '@' => {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '(' | ')' | '#' | '+' | '!' | '|' | '~' | '@' | '&' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -39,7 +44,8 @@ pub fn esc(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    // Autolinks: a scheme separator and a `www.` prefix are what GitHub turns into links.
+    out.replace("://", "\\://").replace("www.", "www\\.")
 }
 
 pub fn render_card(c: &CardInput<'_>) -> String {
@@ -119,6 +125,56 @@ mod tests {
         assert!(!card.contains("<script>"));
         assert!(card.contains("\\@everyone"));
         assert!(!card.contains("\n# heading"));
+    }
+
+    #[test]
+    fn ampersand_is_escaped_so_entities_do_not_render() {
+        assert_eq!(esc("&lt;script&gt;"), "\\&lt;script\\&gt;");
+        assert_eq!(esc("a & b"), "a \\& b");
+    }
+
+    #[test]
+    fn bare_urls_do_not_autolink() {
+        assert_eq!(esc("see https://evil.example/x"), "see https\\://evil.example/x");
+        assert_eq!(esc("HTTP://EVIL.example"), "HTTP\\://EVIL.example");
+        assert_eq!(esc("http://a.example and https://b.example"), "http\\://a.example and https\\://b.example");
+        assert_eq!(esc("www.evil.example"), "www\\.evil.example");
+    }
+
+    #[test]
+    fn issue_and_cross_repo_references_do_not_autolink() {
+        assert_eq!(esc("fixes #123"), "fixes \\#123");
+        assert_eq!(esc("owner/repo#123"), "owner/repo\\#123");
+        assert_eq!(esc("see Soroban-escrow/escrow-backend#7"), "see Soroban-escrow/escrow-backend\\#7");
+    }
+
+    #[test]
+    fn plain_text_is_left_alone() {
+        assert_eq!(esc("adds tests."), "adds tests.");
+        assert_eq!(esc("Plain words, numbers 42"), "Plain words, numbers 42");
+    }
+
+    #[test]
+    fn rendered_card_with_hostile_criteria_matches_snapshot() {
+        let crit = vec![
+            "Fix &lt;b&gt; rendering".to_string(),
+            "Docs at https://evil.example/x and www.evil.example".to_string(),
+            "Refs #123 and owner/repo#123".to_string(),
+        ];
+        let card = render_card(&input(BountyStatus::Open, &crit));
+        let expected = "\
+### SkillEscrow bounty: 5.00 XLM · 🟢 Open
+**Deadline:** 2026-11-17 · **Release on merge:** automatic
+
+**Acceptance criteria**
+- Fix \\&lt;b\\&gt; rendering
+- Docs at https\\://evil.example/x and www\\.evil.example
+- Refs \\#123 and owner/repo\\#123
+
+**How to claim:** open a PR that says `Closes #3`. Link your wallet at https://app.example/me before the merge to be paid instantly.
+
+[Bounty details](https://app.example/b/4)";
+        assert_eq!(card, expected);
     }
 
     #[test]
