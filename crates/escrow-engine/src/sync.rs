@@ -137,7 +137,8 @@ pub async fn announce_payout(d: &SyncDeps, bounty_id: i64) -> Result<bool, Engin
         || format!("`{}…{}`", &winner[..winner.len().min(6)], &winner[winner.len().saturating_sub(4)..]),
         |p| format!("@{}", p.author_login),
     );
-    let net = fees::net(b.amount_i128(), b.fee_bps as u32).map_err(|_| EngineError::Other("fee overflow".into()))?;
+    // a stored fee or amount outside the contract's bounds is a data error: say so instead of posting a wrong amount
+    let net = fees::net(b.amount_i128(), b.fee_bps as u32).map_err(|e| EngineError::Other(format!("fee for bounty {}: {e}", b.id)))?;
     let body = format!(
         "**Paid {} {} to {who}.** [Transaction {}…]({})",
         display(net, 2),
@@ -276,8 +277,22 @@ pub async fn send_wallet_reminders(d: &SyncDeps, grace: Duration, now: DateTime<
         let outcome = if pr.author_login.ends_with("[bot]") {
             "skipped"
         } else {
-            let net = fees::net(b.amount_i128(), b.fee_bps as u32).map_err(|_| EngineError::Other("fee overflow".into()))?;
-            let body = wallet_reminder_body(&pr.author_login, &display(net, 2), &d.tokens.symbol_for(&b.token), b.id, &d.web_url, b.deadline + grace);
+            let net = match fees::net(b.amount_i128(), b.fee_bps as u32) {
+                Ok(net) => net,
+                Err(e) => {
+                    // one bad row must not stop the reminders for every other payout
+                    tracing::warn!(bounty = b.id, error = %e, "wallet reminder skipped: payout amount or fee is out of bounds");
+                    continue;
+                }
+            };
+            let body = wallet_reminder_body(
+                &pr.author_login,
+                &display(net, 2),
+                &d.tokens.symbol_for(&b.token),
+                b.id,
+                &d.web_url,
+                b.deadline + grace,
+            );
             match d.gh.post_comment(repo.installation_id, &repo.full_name, p.pr_number, &body).await {
                 Ok(_) => "sent",
                 // the account is gone or the PR is unreachable: nothing to retry, so record it and tell the maintainers
@@ -347,7 +362,6 @@ mod tests {
             "@octocat your merged PR is waiting for a wallet. **4.85 USDC** is held for you. Link a wallet at https://app.example/me to receive it. If no wallet is linked before 2026-11-20 12:00 UTC, the maintainer may reclaim the funds (bounty #7)."
         );
     }
-
 
     #[test]
     fn symbols_fall_back_to_a_short_id() {
