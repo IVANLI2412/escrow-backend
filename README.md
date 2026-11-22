@@ -122,15 +122,15 @@ escrow-core      pure logic: amounts, fees, /bounty parser, criteria, webhook HM
 
 | Crate | Responsibility | Tests |
 |---|---:|---:|
-| `escrow-core` | the money rules and every parser of untrusted text | 59 |
-| `escrow-chain` | everything that speaks Stellar | 35 + 19 fake-RPC + 4 live (opt-in) |
-| `escrow-db` | schema and queries, verified on real Postgres | 27 |
-| `escrow-github` | GitHub App auth and REST | 23 |
-| `escrow-payouts` | the payout state machine | 20 |
-| `escrow-ai` | the reviewer | 41 |
-| `escrow-engine` | indexer, handlers, worker | 63 |
-| `escrow-api` | routes, auth, CSRF, limits | 48 |
-| `escrowd` | architecture guard rails | 6 |
+| `escrow-core` | the money rules and every parser of untrusted text | 65 |
+| `escrow-chain` | everything that speaks Stellar | 66 (4 `#[ignore]`d: testnet / opt-in live) |
+| `escrow-db` | schema and queries, verified on real Postgres | 31 |
+| `escrow-github` | GitHub App auth and REST | 33 |
+| `escrow-payouts` | the payout state machine | 21 |
+| `escrow-ai` | the reviewer | 61 |
+| `escrow-engine` | indexer, handlers, worker | 93 |
+| `escrow-api` | routes, auth, CSRF, limits | 51 |
+| `escrowd` | architecture guard rails | 11 |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data model, the queue, failure handling and the reasoning behind each decision.
 
