@@ -709,6 +709,29 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     assert_eq!(get(&e, "/me/earnings").await.status, StatusCode::UNAUTHORIZED);
 }
 
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_renamed_repository_shows_its_new_issue_urls_on_the_detail_and_earnings(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let contributor = signed_in(&e, 900, "dev", Some("GCONTRIB"), false).await;
+    let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
+    payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
+    assert_eq!(get(&e, "/bounties/4").await.body["issueUrl"], "https://github.com/acme/widgets/issues/3");
+
+    // what the `repository.renamed` webhook and `sync-installations` both do
+    escrow_db::github::upsert_repo(&pool, seed::REPO_ID, seed::INSTALLATION, "acme/gadgets", false).await.unwrap();
+
+    let detail = get(&e, "/bounties/4").await;
+    assert_eq!(
+        (detail.body["issueUrl"].as_str(), detail.body["repo"]["fullName"].as_str()),
+        (Some("https://github.com/acme/gadgets/issues/3"), Some("acme/gadgets"))
+    );
+    let earnings = call(&e.app, Method::GET, "/me/earnings", &contributor.hdrs(false), None).await;
+    assert_eq!(earnings.body[0]["bounty"]["issueUrl"], "https://github.com/acme/gadgets/issues/3");
+    let listed = get(&e, "/bounties").await;
+    assert_eq!(listed.body["items"][0]["issueUrl"], "https://github.com/acme/gadgets/issues/3");
+}
+
 // ================= funding =================
 
 async fn intent(e: &Env, id: &str, requested_by: i64) {

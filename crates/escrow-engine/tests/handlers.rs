@@ -493,6 +493,49 @@ async fn installing_the_app_registers_the_account_and_its_repositories(pool: PgP
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn renaming_or_transferring_a_repository_rewrites_its_bounties_issue_urls(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    fund_bounty(&w, 4, 3).await;
+    fund_bounty(&w, 5, 9).await;
+    let url = |id| {
+        let pool = pool.clone();
+        async move { bounties::get(&pool, id).await.unwrap().unwrap().issue_url }
+    };
+    assert_eq!(url(4).await, "https://github.com/acme/widgets/issues/3");
+
+    let renamed = json!({ "action": "renamed", "installation": { "id": seed::INSTALLATION },
+        "repository": { "id": seed::REPO_ID, "full_name": "acme/gadgets", "private": false },
+        "changes": { "repository": { "name": { "from": "widgets" } } } });
+    assert_eq!(run(&w, "repository", &renamed).await.unwrap(), "repository.renamed");
+    assert_eq!(github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap().full_name, "acme/gadgets");
+    assert_eq!(url(4).await, "https://github.com/acme/gadgets/issues/3");
+    assert_eq!(url(5).await, "https://github.com/acme/gadgets/issues/9");
+
+    // a transfer to an account where the app has another installation moves the repo under it
+    let transferred = json!({ "action": "transferred",
+        "installation": { "id": 88, "account": { "login": "newco", "type": "Organization" } },
+        "repository": { "id": seed::REPO_ID, "full_name": "newco/gadgets", "private": true } });
+    assert_eq!(run(&w, "repository", &transferred).await.unwrap(), "repository.transferred");
+    let repo = github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap();
+    assert_eq!((repo.full_name.as_str(), repo.installation_id, repo.is_private), ("newco/gadgets", 88, true));
+    assert_eq!(url(4).await, "https://github.com/newco/gadgets/issues/3");
+
+    // without an installation in the payload, a known repo is still renamed; an unknown one is not created
+    let no_inst = json!({ "action": "renamed", "repository": { "id": seed::REPO_ID, "full_name": "newco/thing" } });
+    run(&w, "repository", &no_inst).await.unwrap();
+    assert_eq!(url(5).await, "https://github.com/newco/thing/issues/9");
+    let unknown = json!({ "action": "renamed", "repository": { "id": 999, "full_name": "x/y" } });
+    run(&w, "repository", &unknown).await.unwrap();
+    assert!(github::get_repo(&pool, 999).await.unwrap().is_none());
+
+    // other actions are ignored; a sync that sees the same name changes nothing
+    let archived = json!({ "action": "archived", "repository": { "id": seed::REPO_ID, "full_name": "someone/else" } });
+    assert_eq!(run(&w, "repository", &archived).await.unwrap(), "ignored");
+    assert_eq!(github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap().full_name, "newco/thing");
+    assert_eq!(github::rename_repo(&pool, seed::REPO_ID, "newco/thing").await.unwrap(), 0);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn editing_an_issue_refreshes_the_live_bounties_title_and_criteria(pool: PgPool) {
     let w = world(pool.clone()).await;
     fund_bounty(&w, 4, 3).await;
