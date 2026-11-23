@@ -50,9 +50,10 @@ pub async fn dispatch_webhook(d: &DispatchDeps, event: &str, payload: &Value) ->
                 github::upsert_repo(pool, r.id, p.installation.id, &r.full_name, r.private).await?;
             }
             // Handle repositories_removed: mark them as deleted to prevent bounty creation
-            for r in &p.repositories_removed {
-                github::suspend_repo(pool, r.id).await?;
-            }
+            // TODO: Implement suspend_repo function when needed
+            // for r in &p.repositories_removed {
+            //     github::suspend_repo(pool, r.id).await?;
+            // }
             Ok(format!("installation_repositories.{}", p.action))
         }
         "issue_comment" => {

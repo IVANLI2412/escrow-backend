@@ -304,7 +304,18 @@ impl Config {
 
         let admin_github_ids = r
             .matches("ADMIN_GITHUB_IDS", &digits_list, "comma-separated numeric GitHub ids")
-            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .map(|v| {
+                let ids: Result<Vec<i64>, _> = v.split(',')
+                    .map(|x| x.parse::<i64>().map_err(|_| format!("ADMIN_GITHUB_IDS: '{}' overflows i64", x)))
+                    .collect();
+                match ids {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        r.errors.push(e);
+                        vec![]
+                    }
+                }
+            })
             .unwrap_or_default();
         let anthropic_api_key = r.optional("ANTHROPIC_API_KEY");
         if anthropic_api_key.as_deref().is_some_and(|k| k.len() < 10) {
@@ -346,8 +357,34 @@ impl Config {
             r.errors.push("AI_PRICE_INPUT_PER_MTOK and AI_PRICE_OUTPUT_PER_MTOK: must be positive".into());
         }
 
+        let log_level = r.string("LOG_LEVEL", "info");
+        // Validate LOG_LEVEL against common directives. Full validation happens at runtime in init_logging.
+        let is_valid_level = |s: &str| {
+            const LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace", "off"];
+            // Simple level, e.g. "info", "debug"
+            if LEVELS.contains(&s) {
+                return true;
+            }
+            // Module-level directive, e.g. "escrow_engine=debug,info"
+            s.split(',').all(|part| {
+                let part = part.trim();
+                if LEVELS.contains(&part) {
+                    return true;
+                }
+                // module=level format
+                if let Some((_module, level)) = part.split_once('=') {
+                    LEVELS.contains(&level.trim())
+                } else {
+                    false
+                }
+            })
+        };
+        if !log_level.is_empty() && !is_valid_level(&log_level) {
+            r.errors.push(format!("LOG_LEVEL: '{}' is not a valid log level (use error, warn, info, debug, trace, or module=level)", log_level));
+        }
+
         let cfg = Config {
-            log_level: r.string("LOG_LEVEL", "info"),
+            log_level,
             port: r.number("PORT", 3001u16),
             database_url: r.required("DATABASE_URL"),
             network,
@@ -586,5 +623,21 @@ mod tests {
     fn ai_pricing_must_be_positive() {
         let e = Config::from_map(&with(&[("AI_PRICE_INPUT_PER_MTOK", "0")])).unwrap_err().to_string();
         assert!(e.contains("must be positive"));
+    }
+
+    #[test]
+    fn admin_github_ids_above_i64_max_are_rejected() {
+        let overflow = format!("{}", (i64::MAX as u128) + 1);
+        let e = Config::from_map(&with(&[("ADMIN_GITHUB_IDS", &overflow)])).unwrap_err().to_string();
+        assert!(e.contains("ADMIN_GITHUB_IDS") && e.contains("overflows i64"), "error was: {e}");
+    }
+
+    #[test]
+    fn log_level_is_validated() {
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "info")])).is_ok());
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "debug")])).is_ok());
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "escrow_engine=debug")])).is_ok());
+        let e = Config::from_map(&with(&[("LOG_LEVEL", "verbose")])).unwrap_err().to_string();
+        assert!(e.contains("LOG_LEVEL") && e.contains("not a valid log level"), "error was: {e}");
     }
 }

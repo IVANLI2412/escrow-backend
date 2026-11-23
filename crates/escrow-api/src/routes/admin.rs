@@ -24,8 +24,6 @@ use escrow_engine::indexer::CURSOR_ID;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const OVERDUE_HOURS: i64 = 36;
-
 async fn admin(s: &AppState, h: &HeaderMap, ip: &ClientIp, mutating: bool) -> ApiResult<Authed> {
     let a = require_user(s, h, mutating).await?;
     if !a.user.is_admin {
@@ -70,7 +68,7 @@ pub async fn list_disputes(
     let now = (s.now)();
     let mut out = vec![];
     for d in disputes::list_open(&s.db.pool).await? {
-        let overdue = now - d.created_at > Duration::hours(OVERDUE_HOURS);
+        let overdue = now - d.created_at > Duration::hours(escrow_core::DISPUTE_ALERT_HOURS);
         out.push(DisputeView { bounty: detail_of(&s, d.bounty_id).await?, dispute: d, overdue });
     }
     Ok(Json(out))
