@@ -97,11 +97,17 @@ pub async fn active_for_issues<'e>(ex: impl PgExecutor<'e>, repo_id: i64, issues
     .await
 }
 
-pub async fn by_maintainer<'e>(ex: impl PgExecutor<'e>, wallet: &str) -> Result<Vec<Bounty>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {BOUNTY_COLS} FROM bounties WHERE maintainer = $1 ORDER BY id DESC")))
-        .bind(wallet)
-        .fetch_all(ex)
-        .await
+/// Bounties a maintainer funded, newest first: those funded from `wallet` (their current one, if linked) and those
+/// recorded against their GitHub account, so bounties funded from an earlier wallet stay visible. Each bounty
+/// appears once.
+pub async fn by_maintainer<'e>(ex: impl PgExecutor<'e>, wallet: Option<&str>, github_id: i64) -> Result<Vec<Bounty>, sqlx::Error> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {BOUNTY_COLS} FROM bounties WHERE ($1::text IS NOT NULL AND maintainer = $1) OR maintainer_github_id = $2 ORDER BY id DESC"
+    )))
+    .bind(wallet)
+    .bind(github_id)
+    .fetch_all(ex)
+    .await
 }
 
 pub async fn open_ones<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Bounty>, sqlx::Error> {

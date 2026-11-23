@@ -238,7 +238,7 @@ paths:
   /me/funded:
     get:
       tags: [Me]
-      summary: Bounties funded from your linked wallet
+      summary: Bounties you funded, newest first (from your linked wallet or recorded against your account, so earlier wallets stay visible)
       security: [{ sessionCookie: [] }]
       responses:
         '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Bounty' } } } } }

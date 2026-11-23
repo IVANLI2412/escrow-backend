@@ -760,6 +760,33 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     assert_eq!(get(&e, "/me/earnings").await.status, StatusCode::UNAUTHORIZED);
 }
 
+// #138: /me/funded keeps bounties funded from an earlier wallet, by the maintainer's GitHub account.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn my_funded_covers_the_current_wallet_an_old_wallet_and_no_wallet(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await; // current wallet, recorded against github 500
+    fund_more(&e, 5, 4).await;
+    fund_more(&e, 6, 5).await;
+    fund_more(&e, 7, 6).await;
+    // 5: funded from an earlier wallet of the same account; 6: current wallet, account not yet known; 7: someone else
+    sqlx::query("UPDATE bounties SET maintainer = 'GOLDWALLET' WHERE id = 5").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE bounties SET maintainer_github_id = NULL WHERE id = 6").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE bounties SET maintainer = 'GSOMEONEELSE', maintainer_github_id = 777 WHERE id = 7").execute(&pool).await.unwrap();
+    let ids = |r: &Resp| r.body.as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    let m = signed_in(&e, 500, "maint", Some(seed::MAINTAINER_WALLET), false).await;
+    let r = call(&e.app, Method::GET, "/me/funded", &m.hdrs(false), None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(ids(&r), vec!["6", "5", "4"], "current wallet and old wallet, each once, newest first");
+
+    // after unlinking, the account still sees what is recorded against it
+    sqlx::query("UPDATE users SET wallet = NULL WHERE github_id = 500").execute(&pool).await.unwrap();
+    assert_eq!(ids(&call(&e.app, Method::GET, "/me/funded", &m.hdrs(false), None).await), vec!["5", "4"]);
+
+    let stranger = signed_in(&e, 501, "nowallet", None, false).await;
+    assert_eq!(call(&e.app, Method::GET, "/me/funded", &stranger.hdrs(false), None).await.body, json!([]));
+}
+
 // ================= funding =================
 
 async fn intent(e: &Env, id: &str, requested_by: i64) {

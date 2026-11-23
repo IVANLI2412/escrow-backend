@@ -12,7 +12,7 @@ use crate::{
 use axum::{
     Json,
     extract::{Extension, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, header},
     response::{IntoResponse, Redirect, Response},
 };
 use escrow_core::{
@@ -182,8 +182,6 @@ pub async fn my_earnings(
 
 pub async fn my_funded(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let a = require_user(&s, &headers, false).await?;
-    let Some(w) = a.user.wallet else {
-        return Ok((StatusCode::OK, Json(json!([]))).into_response());
-    };
-    Ok(Json(bounties::by_maintainer(&s.db.pool, &w).await?).into_response())
+    // the current wallet's bounties plus any recorded against this account (e.g. funded from an earlier wallet)
+    Ok(Json(bounties::by_maintainer(&s.db.pool, a.user.wallet.as_deref(), a.user.github_id).await?).into_response())
 }
