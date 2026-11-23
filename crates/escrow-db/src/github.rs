@@ -81,7 +81,8 @@ pub async fn list_repos<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Repo>, sqlx::
 
 /// Whether AI reviews are on for a repository (on unless a `repo_settings` row turns them off).
 pub async fn ai_reviews_enabled<'e>(ex: impl PgExecutor<'e>, repo_id: i64) -> Result<bool, sqlx::Error> {
-    let v: Option<bool> = sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
+    let v: Option<bool> =
+        sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
     Ok(v.unwrap_or(true))
 }
 

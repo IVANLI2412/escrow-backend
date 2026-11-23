@@ -105,6 +105,8 @@ pub struct Config {
     pub vault_transit_key: Option<String>,
     /// Vault token (never printed; `Debug` omits it)
     pub vault_token: Option<String>,
+    /// Configuration warnings (non-fatal but should be addressed)
+    pub warnings: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -138,6 +140,7 @@ impl std::error::Error for ConfigError {}
 struct Reader<'a> {
     env: &'a HashMap<String, String>,
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl<'a> Reader<'a> {
@@ -182,6 +185,25 @@ impl<'a> Reader<'a> {
         }
         v.trim_end_matches('/').to_string()
     }
+    fn url_https_on_mainnet(&mut self, k: &str, default: Option<&str>, network: Network) -> String {
+        let v = self.url(k, default);
+        if !v.is_empty() && network == Network::Mainnet && !v.starts_with("https://") {
+            self.errors.push(format!("{k}: must be https:// on mainnet"));
+        }
+        v
+    }
+    fn optional_url(&mut self, k: &str, network: Network) -> Option<String> {
+        let v = self.optional(k)?;
+        if !(v.starts_with("http://") || v.starts_with("https://")) {
+            self.errors.push(format!("{k}: must be a valid http(s) URL"));
+            return None;
+        }
+        if network != Network::Local && !v.starts_with("https://") {
+            self.errors.push(format!("{k}: must be https:// (unless STELLAR_NETWORK=local)"));
+            return None;
+        }
+        Some(v.trim_end_matches('/').to_string())
+    }
     fn secret_min(&mut self, k: &str, min: usize) -> String {
         let v = self.required(k);
         if !v.is_empty() && v.len() < min {
@@ -198,6 +220,9 @@ impl<'a> Reader<'a> {
             None
         }
     }
+    fn warn(&mut self, msg: String) {
+        self.warnings.push(msg);
+    }
 }
 
 impl Config {
@@ -206,7 +231,7 @@ impl Config {
     }
 
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
-        let mut r = Reader { env, errors: vec![] };
+        let mut r = Reader { env, errors: vec![], warnings: vec![] };
         let strkey_c = Regex::new(r"^C[A-Z2-7]{55}$").unwrap();
         let strkey_s = Regex::new(r"^S[A-Z2-7]{55}$").unwrap();
         let digits_list = Regex::new(r"^\d+(,\d+)*$").unwrap();
@@ -346,6 +371,35 @@ impl Config {
             r.errors.push("AI_PRICE_INPUT_PER_MTOK and AI_PRICE_OUTPUT_PER_MTOK: must be positive".into());
         }
 
+        // Issue #199: Warn for GITHUB_WEBHOOK_SECRET < 32 chars (deprecation path to hard error)
+        let webhook_secret = r.secret_min("GITHUB_WEBHOOK_SECRET", 8);
+        if !webhook_secret.is_empty() && webhook_secret.len() < 32 {
+            r.warn(format!(
+                "GITHUB_WEBHOOK_SECRET: {} characters is below the recommended 32. This will become a hard error in a future release. Generate a 32-byte secret.",
+                webhook_secret.len()
+            ));
+        }
+
+        // Issue #200: Validate ALERT_WEBHOOK_URL as proper URL, require https outside local
+        let alert_webhook_url = r.optional_url("ALERT_WEBHOOK_URL", network);
+
+        // Issue #205: Require https URLs on mainnet for public URLs
+        let api_public_url = r.url_https_on_mainnet("API_PUBLIC_URL", Some("http://localhost:3001"), network);
+        let web_public_url = r.url_https_on_mainnet("WEB_PUBLIC_URL", Some("http://localhost:3000"), network);
+
+        // Issue #204: Warn about DB_MAX_CONNECTIONS too small for worker concurrency
+        let db_max_connections = r.number("DB_MAX_CONNECTIONS", 10u32);
+        let worker_concurrency = r.number("WORKER_CONCURRENCY", 4usize);
+
+        // Calculate recommended minimum: API (2) + indexer (1) + relayer (1) + periodic (1) + workers (concurrency * 2 for transaction + GitHub calls)
+        let recommended_min_connections = 5 + (worker_concurrency * 2);
+        if (db_max_connections as usize) < recommended_min_connections {
+            r.warn(format!(
+                "DB_MAX_CONNECTIONS: {} is below the recommended minimum of {} for WORKER_CONCURRENCY={}. The pool may starve under load. Formula: 5 (API + indexer + relayer + periodic) + (workers × 2).",
+                db_max_connections, recommended_min_connections, worker_concurrency
+            ));
+        }
+
         let cfg = Config {
             log_level: r.string("LOG_LEVEL", "info"),
             port: r.number("PORT", 3001u16),
@@ -354,11 +408,11 @@ impl Config {
             rpc_url: r.url("STELLAR_RPC_URL", default_rpc),
             network_passphrase: r.string("STELLAR_NETWORK_PASSPHRASE", default_pass),
             contract_id,
-            api_public_url: r.url("API_PUBLIC_URL", Some("http://localhost:3001")),
-            web_public_url: r.url("WEB_PUBLIC_URL", Some("http://localhost:3000")),
+            api_public_url,
+            web_public_url,
             session_secret: r.secret_min("SESSION_SECRET", 32),
             csrf_secret: r.secret_min("CSRF_SECRET", 32),
-            webhook_secret: r.secret_min("GITHUB_WEBHOOK_SECRET", 8),
+            webhook_secret,
             github,
             admin_github_ids,
             anthropic_api_key,
@@ -375,7 +429,7 @@ impl Config {
             relayer_secret,
             relayer_channel_secrets,
             relayer_min_xlm_alert: r.number("RELAYER_MIN_XLM_ALERT", 50.0f64),
-            alert_webhook_url: r.optional("ALERT_WEBHOOK_URL"),
+            alert_webhook_url,
             token_usdc: r.string("TOKEN_USDC_CONTRACT_ID", ""),
             token_xlm: r.string("TOKEN_XLM_CONTRACT_ID", ""),
             token_min,
@@ -388,13 +442,14 @@ impl Config {
             trust_proxy: matches!(r.raw("TRUST_PROXY"), Some("1" | "true")),
             metrics_token: r.optional("METRICS_TOKEN"),
             indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
-            db_max_connections: r.number("DB_MAX_CONNECTIONS", 10u32),
-            worker_concurrency: r.number("WORKER_CONCURRENCY", 4usize),
+            db_max_connections,
+            worker_concurrency,
             shared_rate_limits,
             relayer_signer,
             vault_addr,
             vault_transit_key,
             vault_token,
+            warnings: r.warnings,
         };
         if r.errors.is_empty() { Ok(cfg) } else { Err(ConfigError(r.errors)) }
     }
@@ -489,7 +544,13 @@ mod tests {
     fn mainnet_makes_you_choose_an_rpc_provider() {
         let e = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet")])).unwrap_err().to_string();
         assert!(e.contains("STELLAR_RPC_URL: required"), "{e}");
-        let c = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet"), ("STELLAR_RPC_URL", "https://rpc.example/")])).unwrap();
+        let c = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("API_PUBLIC_URL", "https://api.example/"),
+            ("WEB_PUBLIC_URL", "https://web.example/"),
+        ]))
+        .unwrap();
         assert_eq!(c.rpc_url, "https://rpc.example");
         assert_eq!(c.network_passphrase, "Public Global Stellar Network ; September 2015");
         assert!(c.explorer_tx_template.contains("/explorer/public/"));
@@ -586,5 +647,195 @@ mod tests {
     fn ai_pricing_must_be_positive() {
         let e = Config::from_map(&with(&[("AI_PRICE_INPUT_PER_MTOK", "0")])).unwrap_err().to_string();
         assert!(e.contains("must be positive"));
+    }
+
+    // Issue #199: GITHUB_WEBHOOK_SECRET minimum length warning
+    #[test]
+    fn webhook_secret_below_32_chars_produces_warning() {
+        let c = Config::from_map(&with(&[
+            ("GITHUB_WEBHOOK_SECRET", "short123"),
+            ("DB_MAX_CONNECTIONS", "20"),  // Set high enough to avoid DB warning
+        ]))
+        .unwrap();
+        assert_eq!(c.webhook_secret, "short123");
+        assert_eq!(c.warnings.len(), 1);
+        assert!(c.warnings[0].contains("GITHUB_WEBHOOK_SECRET"));
+        assert!(c.warnings[0].contains("8 characters"));
+        assert!(c.warnings[0].contains("recommended 32"));
+        assert!(c.warnings[0].contains("future release"));
+    }
+
+    #[test]
+    fn webhook_secret_at_32_chars_has_no_warning() {
+        let c = Config::from_map(&with(&[("GITHUB_WEBHOOK_SECRET", &"x".repeat(32))])).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("GITHUB_WEBHOOK_SECRET")));
+    }
+
+    #[test]
+    fn webhook_secret_still_accepts_8_chars_minimum() {
+        // During deprecation window, 8 chars is accepted but warned
+        let c = Config::from_map(&with(&[("GITHUB_WEBHOOK_SECRET", "12345678")])).unwrap();
+        assert_eq!(c.webhook_secret, "12345678");
+        assert!(c.warnings.iter().any(|w| w.contains("GITHUB_WEBHOOK_SECRET")));
+    }
+
+    #[test]
+    fn webhook_secret_below_8_chars_is_error() {
+        let e = Config::from_map(&with(&[("GITHUB_WEBHOOK_SECRET", "short")])).unwrap_err().to_string();
+        assert!(e.contains("GITHUB_WEBHOOK_SECRET"));
+        assert!(e.contains("at least 8 characters"));
+    }
+
+    // Issue #200: ALERT_WEBHOOK_URL validation
+    #[test]
+    fn alert_webhook_url_accepts_valid_https() {
+        let c = Config::from_map(&with(&[("ALERT_WEBHOOK_URL", "https://hooks.example.com/webhook")])).unwrap();
+        assert_eq!(c.alert_webhook_url.as_deref(), Some("https://hooks.example.com/webhook"));
+        assert!(!c.warnings.iter().any(|w| w.contains("ALERT_WEBHOOK_URL")));
+    }
+
+    #[test]
+    fn alert_webhook_url_rejects_non_url() {
+        let e = Config::from_map(&with(&[("ALERT_WEBHOOK_URL", "not-a-url")])).unwrap_err().to_string();
+        assert!(e.contains("ALERT_WEBHOOK_URL"));
+        assert!(e.contains("valid http(s) URL"));
+    }
+
+    #[test]
+    fn alert_webhook_url_rejects_http_on_testnet() {
+        let e = Config::from_map(&with(&[("ALERT_WEBHOOK_URL", "http://insecure.example.com/webhook"), ("STELLAR_NETWORK", "testnet")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ALERT_WEBHOOK_URL"));
+        assert!(e.contains("must be https://"));
+    }
+
+    #[test]
+    fn alert_webhook_url_accepts_http_on_local() {
+        let c = Config::from_map(&with(&[("ALERT_WEBHOOK_URL", "http://localhost:8080/webhook"), ("STELLAR_NETWORK", "local")])).unwrap();
+        assert_eq!(c.alert_webhook_url.as_deref(), Some("http://localhost:8080/webhook"));
+    }
+
+    #[test]
+    fn alert_webhook_url_optional_when_not_set() {
+        let c = Config::from_map(&base()).unwrap();
+        assert_eq!(c.alert_webhook_url, None);
+    }
+
+    // Issue #205: HTTPS URLs required on mainnet
+    #[test]
+    fn mainnet_requires_https_api_public_url() {
+        let e = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("API_PUBLIC_URL", "http://api.example.com/"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("API_PUBLIC_URL"));
+        assert!(e.contains("must be https://"));
+        assert!(e.contains("mainnet"));
+    }
+
+    #[test]
+    fn mainnet_requires_https_web_public_url() {
+        let e = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("API_PUBLIC_URL", "https://api.example.com/"),
+            ("WEB_PUBLIC_URL", "http://web.example.com/"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("WEB_PUBLIC_URL"));
+        assert!(e.contains("must be https://"));
+        assert!(e.contains("mainnet"));
+    }
+
+    #[test]
+    fn mainnet_accepts_https_urls() {
+        let c = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("API_PUBLIC_URL", "https://api.example.com/"),
+            ("WEB_PUBLIC_URL", "https://web.example.com/"),
+        ]))
+        .unwrap();
+        assert_eq!(c.api_public_url, "https://api.example.com");
+        assert_eq!(c.web_public_url, "https://web.example.com");
+        assert!(c.secure_cookies());
+    }
+
+    #[test]
+    fn testnet_accepts_http_urls() {
+        let c = Config::from_map(&with(&[("API_PUBLIC_URL", "http://api.test.example/"), ("WEB_PUBLIC_URL", "http://web.test.example/")]))
+            .unwrap();
+        assert_eq!(c.network, Network::Testnet);
+        assert_eq!(c.api_public_url, "http://api.test.example");
+        assert_eq!(c.web_public_url, "http://web.test.example");
+    }
+
+    #[test]
+    fn local_accepts_http_urls() {
+        let c = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "local"),
+            ("API_PUBLIC_URL", "http://localhost:3001/"),
+            ("WEB_PUBLIC_URL", "http://localhost:3000/"),
+        ]))
+        .unwrap();
+        assert_eq!(c.network, Network::Local);
+        assert_eq!(c.api_public_url, "http://localhost:3001");
+        assert_eq!(c.web_public_url, "http://localhost:3000");
+    }
+
+    // Issue #204: DB_MAX_CONNECTIONS warning for worker concurrency
+    #[test]
+    fn db_max_connections_below_recommended_produces_warning() {
+        let c = Config::from_map(&with(&[("DB_MAX_CONNECTIONS", "10"), ("WORKER_CONCURRENCY", "4")])).unwrap();
+        // Recommended = 5 + (4 * 2) = 13
+        assert!(
+            c.warnings.iter().any(|w| { w.contains("DB_MAX_CONNECTIONS") && w.contains("10") && w.contains("recommended minimum of 13") })
+        );
+    }
+
+    #[test]
+    fn db_max_connections_at_recommended_has_no_warning() {
+        let c = Config::from_map(&with(&[("DB_MAX_CONNECTIONS", "13"), ("WORKER_CONCURRENCY", "4")])).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("DB_MAX_CONNECTIONS")));
+    }
+
+    #[test]
+    fn db_max_connections_above_recommended_has_no_warning() {
+        let c = Config::from_map(&with(&[("DB_MAX_CONNECTIONS", "20"), ("WORKER_CONCURRENCY", "4")])).unwrap();
+        assert!(!c.warnings.iter().any(|w| w.contains("DB_MAX_CONNECTIONS")));
+    }
+
+    #[test]
+    fn db_max_connections_warning_scales_with_concurrency() {
+        let c = Config::from_map(&with(&[("DB_MAX_CONNECTIONS", "10"), ("WORKER_CONCURRENCY", "8")])).unwrap();
+        // Recommended = 5 + (8 * 2) = 21
+        assert!(c.warnings.iter().any(|w| {
+            w.contains("DB_MAX_CONNECTIONS") && w.contains("recommended minimum of 21") && w.contains("WORKER_CONCURRENCY=8")
+        }));
+    }
+
+    #[test]
+    fn db_max_connections_warning_includes_formula() {
+        let c = Config::from_map(&with(&[("DB_MAX_CONNECTIONS", "5"), ("WORKER_CONCURRENCY", "2")])).unwrap();
+        let warning = c.warnings.iter().find(|w| w.contains("DB_MAX_CONNECTIONS")).expect("should have warning");
+        assert!(warning.contains("Formula"));
+        assert!(warning.contains("× 2"));
+    }
+
+    #[test]
+    fn multiple_warnings_accumulate() {
+        let c = Config::from_map(&with(&[
+            ("GITHUB_WEBHOOK_SECRET", "shortish"), // 8 chars - below 32, produces warning
+            ("DB_MAX_CONNECTIONS", "5"),           // too small for default concurrency
+        ]))
+        .unwrap();
+        assert_eq!(c.warnings.len(), 2);
+        assert!(c.warnings.iter().any(|w| w.contains("GITHUB_WEBHOOK_SECRET")));
+        assert!(c.warnings.iter().any(|w| w.contains("DB_MAX_CONNECTIONS")));
     }
 }

@@ -12,10 +12,10 @@ pub mod error;
 pub mod events;
 pub mod keys;
 pub mod ports;
-pub mod signer;
 pub mod relayer;
 pub mod rpc;
 pub mod scval;
+pub mod signer;
 pub mod tx;
 pub mod types;
 

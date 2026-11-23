@@ -207,11 +207,7 @@ pub async fn list_payouts(
     }
     let limit = match q.limit.as_deref() {
         None => 50,
-        Some(l) => l
-            .parse::<i64>()
-            .ok()
-            .filter(|n| (1..=100).contains(n))
-            .ok_or_else(|| ApiError::bad_request("invalid limit"))?,
+        Some(l) => l.parse::<i64>().ok().filter(|n| (1..=100).contains(n)).ok_or_else(|| ApiError::bad_request("invalid limit"))?,
     };
     let filter = payouts::ListFilter { status, bounty_id, cursor: q.cursor, limit };
     let mut rows = payouts::list(&s.db.pool, &filter).await?;

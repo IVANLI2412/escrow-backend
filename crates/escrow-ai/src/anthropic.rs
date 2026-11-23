@@ -38,8 +38,7 @@ impl AnthropicModel {
     }
 
     pub fn with_base_and_timeout(api_key: &str, model: &str, base: &str, timeout: Duration) -> Self {
-        let http =
-            reqwest::Client::builder().timeout(timeout).user_agent("skillescrow-backend").build().expect("client builds");
+        let http = reqwest::Client::builder().timeout(timeout).user_agent("skillescrow-backend").build().expect("client builds");
         Self { http, api_key: api_key.into(), model: model.into(), base: base.trim_end_matches('/').into() }
     }
 }

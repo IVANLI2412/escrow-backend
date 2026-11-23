@@ -127,7 +127,11 @@ pub fn sign(tx: Transaction, network_id: [u8; 32], signer: &keys::Signer) -> Res
 
 /// Signs with any [`SignatureProvider`], a local key or a remote one such as Vault Transit, so the relayer never
 /// needs the secret. The decorated signature's hint is the last four bytes of the provider's public key.
-pub async fn sign_with(tx: Transaction, network_id: [u8; 32], provider: &dyn SignatureProvider) -> Result<(TransactionEnvelope, [u8; 32]), ChainError> {
+pub async fn sign_with(
+    tx: Transaction,
+    network_id: [u8; 32],
+    provider: &dyn SignatureProvider,
+) -> Result<(TransactionEnvelope, [u8; 32]), ChainError> {
     let mut env = envelope(tx);
     let hash = tx_hash(&env, network_id)?;
     let public = provider.public_key().await?;
