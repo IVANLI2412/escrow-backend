@@ -226,16 +226,28 @@ pub struct EarningBounty {
     pub issue_title: String,
 }
 
-pub async fn earnings<'e>(ex: impl PgExecutor<'e>, github_id: i64, only_confirmed: bool) -> Result<Vec<Earning>, sqlx::Error> {
+/// One page of a contributor's payouts, newest first (`created_at DESC, id DESC`). `cursor` is the id of the
+/// last payout on the previous page; returns up to `limit + 1` rows so the caller can tell whether another page exists.
+pub async fn earnings<'e>(
+    ex: impl PgExecutor<'e>,
+    github_id: i64,
+    only_confirmed: bool,
+    cursor: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Earning>, sqlx::Error> {
     let mut rows: Vec<Earning> = sqlx::query_as(
         "SELECT p.id, p.bounty_id, p.pr_number, p.winner_github_id, p.winner_address, p.status, p.idempotency_key, p.tx_hash, p.attempts,
                 p.last_error, p.created_at, p.updated_at,
                 b.token AS b_token, b.amount::text AS b_amount, b.fee_bps AS b_fee_bps, b.issue_title AS b_title, b.id AS b_id, b.issue_url AS b_url
          FROM payouts p JOIN bounties b ON b.id = p.bounty_id
-         WHERE p.winner_github_id = $1 AND ($2 = FALSE OR p.status = 'CONFIRMED') ORDER BY p.created_at DESC",
+         WHERE p.winner_github_id = $1 AND ($2 = FALSE OR p.status = 'CONFIRMED')
+           AND ($3::text IS NULL OR (p.created_at, p.id) < (SELECT c.created_at, c.id FROM payouts c WHERE c.id = $3 AND c.winner_github_id = $1))
+         ORDER BY p.created_at DESC, p.id DESC LIMIT $4",
     )
     .bind(github_id)
     .bind(only_confirmed)
+    .bind(cursor)
+    .bind(limit + 1)
     .fetch_all(ex)
     .await?;
     for r in &mut rows {

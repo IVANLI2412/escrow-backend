@@ -97,8 +97,13 @@ paths:
     get:
       tags: [Public]
       summary: A contributor's public record
-      description: Only confirmed payouts are shown; the transaction hash makes each one verifiable on chain.
-      parameters: [{ name: login, in: path, required: true, schema: { type: string } }]
+      description: |
+        Only confirmed payouts are shown; the transaction hash makes each one verifiable on chain. `paid` is one page,
+        newest first; pass `nextCursor` as `cursor` for the next.
+      parameters:
+        - { name: login, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/EarningsCursor' }
+        - { $ref: '#/components/parameters/EarningsLimit' }
       responses:
         '200':
           description: OK
@@ -106,6 +111,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [login, paid, nextCursor]
                 properties:
                   login: { type: string }
                   avatarUrl: { type: [string, 'null'] }
@@ -116,6 +122,8 @@ paths:
                       properties:
                         bounty: { $ref: '#/components/schemas/EarningBounty' }
                         txHash: { type: [string, 'null'] }
+                  nextCursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /auth/login:
     get:
@@ -211,8 +219,21 @@ paths:
       tags: [Me]
       summary: Your payouts, newest first (any status)
       security: [{ sessionCookie: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/EarningsCursor' }
+        - { $ref: '#/components/parameters/EarningsLimit' }
       responses:
-        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Earning' } } } } }
+        '200':
+          description: A page of your payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Earning' } }
+                  nextCursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
   /me/funded:
     get:
@@ -476,6 +497,8 @@ components:
   parameters:
     BountyId: { name: id, in: path, required: true, description: Bounty id (the contract's u64, as a string), schema: { type: string, pattern: '^\d{1,18}$' } }
     DisputeId: { name: id, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9]{10,40}$' } }
+    EarningsCursor: { name: cursor, in: query, description: The previous page's `nextCursor` (a payout id), schema: { type: string, pattern: '^[a-z0-9]{10,40}$' } }
+    EarningsLimit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
   responses:
     Error:
       description: Error

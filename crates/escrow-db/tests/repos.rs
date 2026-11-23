@@ -330,12 +330,12 @@ async fn earnings_join_the_bounty_facts(pool: PgPool) {
     bounty(&pool, 4, 3, 50_000_000, 14).await;
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
     payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
-    let all = payouts::earnings(&pool, 900, false).await.unwrap();
+    let all = payouts::earnings(&pool, 900, false, None, 20).await.unwrap();
     let j = serde_json::to_value(&all[0]).unwrap();
     assert_eq!(j["bounty"]["amount"], "50000000");
     assert_eq!(j["bounty"]["feeBps"], 300);
     assert_eq!(j["status"], "CONFIRMED");
-    assert_eq!(payouts::earnings(&pool, 901, false).await.unwrap().len(), 0);
+    assert_eq!(payouts::earnings(&pool, 901, false, None, 20).await.unwrap().len(), 0);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

@@ -4,6 +4,7 @@ use crate::{
     error::{ApiError, ApiResult},
     extract::{ApiJson, ClientIp},
     metrics::Metrics,
+    routes::public::{EarningsQuery, earnings_page},
     session::{self, limit_key, require_user},
     state::AppState,
     wallet,
@@ -18,7 +19,7 @@ use escrow_core::{
     oauth::{OAUTH_COOKIE, StateError, clear_cookie, cookie_value, safe_next, session_cookie, start_login, state_cookie, verify_state},
     security::csrf_token,
 };
-use escrow_db::{bounties, payouts, users};
+use escrow_db::{bounties, users};
 use escrow_github::OAuthError;
 use escrow_payouts::on_wallet_linked;
 use serde::Deserialize;
@@ -169,9 +170,14 @@ pub async fn wallet_unlink(State(s): State<AppState>, headers: HeaderMap) -> Api
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn my_earnings(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+pub async fn my_earnings(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<EarningsQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Response> {
     let a = require_user(&s, &headers, false).await?;
-    Ok(Json(payouts::earnings(&s.db.pool, a.user.github_id, false).await?).into_response())
+    let page = earnings_page(&s, a.user.github_id, false, q).await?;
+    Ok(Json(json!({ "items": page.items, "nextCursor": page.next_cursor })).into_response())
 }
 
 pub async fn my_funded(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {

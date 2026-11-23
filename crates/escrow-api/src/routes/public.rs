@@ -181,15 +181,55 @@ pub async fn get_bounty(State(s): State<AppState>, Path(id): Path<String>) -> Ap
     detail_of(&s, id.parse().map_err(|_| ApiError::not_found("bounty"))?).await?.map(Json).ok_or_else(|| ApiError::not_found("bounty"))
 }
 
-pub async fn get_user(State(s): State<AppState>, Path(login): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+/// `limit` and `cursor` for the earnings lists (`/me/earnings` and a public profile's `paid`).
+#[derive(Deserialize, Default)]
+pub struct EarningsQuery {
+    cursor: Option<String>,
+    limit: Option<String>,
+}
+
+/// A page of payouts as `/bounties` pages: the rows and the cursor for the next page, if any.
+pub(crate) struct EarningsPage {
+    pub items: Vec<payouts::Earning>,
+    pub next_cursor: Option<String>,
+}
+
+/// Loads one page of `github_id`'s payouts, validating `limit` (1–50, default 20) and `cursor` (a payout id).
+pub(crate) async fn earnings_page(
+    s: &AppState,
+    github_id: i64,
+    only_confirmed: bool,
+    q: Result<Query<EarningsQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<EarningsPage> {
+    let Query(q) = q.map_err(|_| ApiError::bad_request("invalid query"))?;
+    let bad = || ApiError::bad_request("invalid query");
+    if q.cursor
+        .as_deref()
+        .is_some_and(|c| !(10..=40).contains(&c.len()) || !c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    {
+        return Err(bad());
+    }
+    let limit = match q.limit.as_deref() {
+        None => 20,
+        Some(l) => l.parse::<i64>().ok().filter(|n| (1..=50).contains(n)).ok_or_else(bad)?,
+    };
+    let mut items = payouts::earnings(&s.db.pool, github_id, only_confirmed, q.cursor.as_deref(), limit).await?;
+    let more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    let next_cursor = if more { items.last().map(|e| e.payout.id.clone()) } else { None };
+    Ok(EarningsPage { items, next_cursor })
+}
+
+pub async fn get_user(
+    State(s): State<AppState>,
+    Path(login): Path<String>,
+    q: Result<Query<EarningsQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
     if login.len() > 39 || !login.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err(ApiError::not_found("user"));
     }
     let u = users::by_login(&s.db.pool, &login).await?.ok_or_else(|| ApiError::not_found("user"))?;
-    let paid: Vec<_> = payouts::earnings(&s.db.pool, u.github_id, true)
-        .await?
-        .into_iter()
-        .map(|e| json!({ "bounty": e.bounty, "txHash": e.payout.tx_hash }))
-        .collect();
-    Ok(Json(json!({ "login": u.github_login, "avatarUrl": u.avatar_url, "paid": paid })))
+    let page = earnings_page(&s, u.github_id, true, q).await?;
+    let paid: Vec<_> = page.items.into_iter().map(|e| json!({ "bounty": e.bounty, "txHash": e.payout.tx_hash })).collect();
+    Ok(Json(json!({ "login": u.github_login, "avatarUrl": u.avatar_url, "paid": paid, "nextCursor": page.next_cursor })))
 }
