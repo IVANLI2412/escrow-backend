@@ -278,3 +278,13 @@ impl TxBuilder for SorobanChain {
 pub fn page_ledger(p: &EventsPage) -> u32 {
     cursor_ledger(&p.cursor)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ChainError;
+
+    #[test]
+    fn busy_error_is_transient() {
+        assert!(ChainError::Busy.is_transient());
+    }
+}

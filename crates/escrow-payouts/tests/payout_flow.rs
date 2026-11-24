@@ -332,6 +332,17 @@ async fn a_contract_rejection_fails_at_once_without_retrying(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn busy_signer_records_attempt_and_leaves_payout_queued(pool: PgPool) {
+    let e = env(pool.clone()).await;
+    queued(&e).await;
+    e.signer.submits.lock().unwrap().push_back(Err(ChainError::Busy));
+    let r = relay_release(&e.d, &*e.signer, 4).await;
+    assert!(matches!(r, Err(PayoutError::Transient(_))));
+    let p = payouts::for_bounty(&pool, 4).await.unwrap().unwrap();
+    assert_eq!((p.status.as_str(), p.attempts, p.tx_hash), ("QUEUED", 1, None));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn transient_failures_retry_then_give_up_after_the_limit(pool: PgPool) {
     let e = env(pool.clone()).await;
     queued(&e).await;
