@@ -147,7 +147,7 @@ async fn help_and_usage_errors_reply_with_the_command_list(pool: PgPool) {
     assert_eq!(run(&w, "issue_comment", &say("/bounty help", "stranger")).await.unwrap(), "help");
     assert_eq!(run(&w, "issue_comment", &say("/bounty fifty", "stranger")).await.unwrap(), "error");
     let b = w.gh.bodies();
-    assert!(b[0].contains("SkillEscrow commands") && b[1].contains("Invalid amount \"fifty\"") && b[1].contains("SkillEscrow commands"));
+    assert!(b[0].contains("SkillEscrow commands") && b[0].contains("/bounty review") && b[1].contains("Invalid amount \"fifty\"") && b[1].contains("SkillEscrow commands"));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -184,7 +184,7 @@ async fn disputes_come_only_from_the_maintainer_or_a_linked_pr_author(pool: PgPo
         (900, "it was reviewed unfairly", "requested")
     );
     assert!(audit::exists(&pool, "dispute.requested", "bounty:4").await.unwrap());
-    assert!(w.gh.bodies().last().unwrap().contains("A human will review this within 48 hours"));
+    assert!(w.gh.bodies().last().unwrap().contains(&format!("A human will review this within {} hours", escrow_core::DISPUTE_RESPONSE_HOURS)));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

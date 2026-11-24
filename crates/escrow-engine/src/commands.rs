@@ -46,6 +46,7 @@ const WRITERS: [&str; 3] = ["admin", "maintain", "write"];
 const HELP: &str = "**SkillEscrow commands**\n\
 - `/bounty <amount> [USDC|XLM] [<days>d]` fund this issue, e.g. `/bounty 50 USDC 14d` (needs write access)\n\
 - `/bounty dispute <reason>` flag a problem on a bountied issue\n\
+- `/bounty review` request an AI review of a PR (PRs only, needs write access)\n\
 - `/bounty help`";
 
 /// What happened, as a short label for logs and tests. User mistakes get a friendly reply and are not errors;
@@ -118,7 +119,7 @@ pub async fn handle_issue_comment(d: &CommandDeps, ev: &IssueCommentEvent) -> Re
                 &serde_json::json!({ "dispute": dsp.id }),
             )
             .await?;
-            reply("Dispute recorded. A human will review this within 48 hours.".into()).await?;
+            reply(format!("Dispute recorded. A human will review this within {} hours.", escrow_core::DISPUTE_RESPONSE_HOURS)).await?;
             Ok("dispute-requested".into())
         }
         Command::Fund { amount, token, days } => {

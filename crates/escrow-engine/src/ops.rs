@@ -76,9 +76,9 @@ pub async fn collect_alerts(db: &Db, a: &AlertInputs) -> Result<Vec<Alert>, sqlx
             out.push(Alert::new("indexer_lag", format!("Indexer is {lag} ledgers behind")));
         }
     }
-    let stale = disputes::count_open_older_than(&db.pool, a.now - Duration::hours(36)).await?;
+    let stale = disputes::count_open_older_than(&db.pool, a.now - Duration::hours(escrow_core::DISPUTE_ALERT_HOURS)).await?;
     if stale > 0 {
-        out.push(Alert::new("disputes_stale", format!("{stale} dispute(s) older than 36 h")));
+        out.push(Alert::new("disputes_stale", format!("{stale} dispute(s) older than {} h", escrow_core::DISPUTE_ALERT_HOURS)));
     }
     // merged-but-unpaid PRs whose refund window opens within 72 h: the arbiter may need to act
     let risky: Vec<(i64, String)> = sqlx::query_as(

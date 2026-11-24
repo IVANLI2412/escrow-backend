@@ -108,6 +108,7 @@ fn check_metrics(r: &mut Report, token: Option<&str>) {
 pub async fn run(cfg: Config, as_json: bool) -> Result<()> {
     let mut r = Report::new();
     r.ok("configuration", format!("valid ({:?}, contract {}…)", cfg.network, &cfg.contract_id[..8]));
+    r.ok("log level", format!("{}", cfg.log_level));
     check_metrics(&mut r, cfg.metrics_token.as_deref());
 
     match runtime::connect(cfg.clone(), false).await {
