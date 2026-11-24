@@ -253,6 +253,15 @@ pub async fn poll_once(d: &IndexerDeps) -> Result<PollReport, EngineError> {
                     if matches!(ev, ChainEvent::Released { .. }) {
                         jobs::enqueue_payout_announcement(&mut *tx, bid).await?;
                     }
+                    // The chain says a dispute was opened or resolved: tell the issue, once per event.
+                    let dispute_kind = match &ev {
+                        ChainEvent::Disputed { .. } => Some("disputed"),
+                        ChainEvent::Resolved { .. } => Some("resolved"),
+                        _ => None,
+                    };
+                    if let Some(kind) = dispute_kind {
+                        jobs::enqueue_dispute_comment(&mut *tx, bid, kind, None, meta.event_id).await?;
+                    }
                 }
                 Outcome::Anomaly => {
                     report.anomalies += 1;

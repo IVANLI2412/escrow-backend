@@ -12,8 +12,8 @@ use escrow_engine::{
     ops::{Alert, AlertInputs, AlertSender, collect_alerts, health_report},
     ports::{ReviewFailure, ReviewRunner},
     sync::{
-        CardOutcome, GithubCommenter, GithubNotifier, IssueCommenter, announce_payout, refresh_bounty_card, send_refund_reminders,
-        sync_installations,
+        CardOutcome, GithubCommenter, GithubNotifier, IssueCommenter, announce_payout, dispute_comment_body, post_dispute_comment,
+        refresh_bounty_card, send_refund_reminders, sync_installations,
     },
     worker::{WorkerDeps, handle_job, run_queue},
 };
@@ -144,6 +144,32 @@ async fn a_paid_comment_names_the_contributor_and_links_the_transaction_once(poo
     assert!(c.body.starts_with("**Paid 4.85 XLM to @dev.**") && c.body.contains("](https://explorer.example/tx/abababab"), "{}", c.body);
     assert!(!announce_payout(&w.sync(), 4).await.unwrap(), "a replayed event never comments twice");
     assert_eq!(w.gh.comments().len(), 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn dispute_comment_jobs_post_the_outcome_and_the_arbiter_note_once(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    kinds::enqueue_dispute_comment(&pool, 4, "disputed", None, "event-111").await.unwrap();
+    kinds::enqueue_dispute_comment(&pool, 4, "resolved", None, "event-120").await.unwrap();
+    kinds::enqueue_dispute_comment(&pool, 4, "rejected", Some("no merit"), "dispute:xyz").await.unwrap();
+    let stop = CancellationToken::new();
+    let q = tokio::spawn(run_queue(worker(&w, None), stop.clone(), 2, std::time::Duration::from_millis(10)));
+    until(|| async { status_of(&pool, "dispute.comment").await == ["done", "done", "done"] }).await;
+    stop.cancel();
+    q.await.unwrap();
+
+    let comments = w.gh.comments();
+    assert_eq!(comments.len(), 3);
+    assert!(comments.iter().all(|c| c.issue == 3));
+    let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+    assert_eq!(bodies[0], dispute_comment_body("disputed", None));
+    assert_eq!(bodies[1], dispute_comment_body("resolved", None));
+    assert!(bodies[2].contains("no merit"), "{}", bodies[2]);
+
+    // A replay of the same event/decision is a no-op: the audit marker was written after GitHub accepted it.
+    assert!(!post_dispute_comment(&w.sync(), 4, bodies[0], "event-111").await.unwrap());
+    assert_eq!(w.gh.comments().len(), 3);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

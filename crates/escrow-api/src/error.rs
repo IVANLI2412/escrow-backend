@@ -6,8 +6,9 @@ use axum::{
 use escrow_chain::ChainError;
 use serde_json::json;
 
-/// Every error leaves the API as `{ "error": { "code": "...", "message": "..." } }`.
-/// `code` is stable and meant for programs; `message` is for people.
+/// Every error leaves the API as `{ "error": { "code": "...", "message": "...", "request_id": "..." } }`.
+/// `code` is stable and meant for programs; `message` is for people; `request_id` is the id to quote in
+/// a support request. The outer request-id middleware fills in that last field.
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,

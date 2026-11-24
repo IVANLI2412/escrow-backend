@@ -423,6 +423,12 @@ async fn webhook_redelivery_and_cursor_and_audit(pool: PgPool) {
     assert!(webhooks::insert_delivery(&pool, "d1", "issue_comment").await.unwrap());
     assert!(!webhooks::insert_delivery(&pool, "d1", "issue_comment").await.unwrap(), "GitHub redelivery is recognised");
     webhooks::mark_processed(&pool, "d1", Some("boom")).await.unwrap();
+    assert!(webhooks::retry_failed_delivery(&pool, "d1").await.unwrap(), "a failed delivery may be retried");
+    assert!(!webhooks::retry_failed_delivery(&pool, "d1").await.unwrap(), "the failure has been cleared");
+    webhooks::mark_processed(&pool, "d1", None).await.unwrap();
+    assert!(!webhooks::retry_failed_delivery(&pool, "d1").await.unwrap(), "a success stays a duplicate");
+    webhooks::insert_delivery(&pool, "d2", "ping").await.unwrap();
+    assert!(!webhooks::retry_failed_delivery(&pool, "d2").await.unwrap(), "a still-queued delivery stays a duplicate");
 
     assert!(webhooks::get_cursor(&pool, "bounty_escrow").await.unwrap().is_none());
     webhooks::save_cursor(&pool, "bounty_escrow", "c1", 10).await.unwrap();

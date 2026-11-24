@@ -200,7 +200,9 @@ async fn every_response_carries_the_security_headers_and_errors_use_one_shape(po
     let e = env(pool, true, vec![]);
     let r = get(&e, "/bounties/abc").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(r.body, json!({ "error": { "code": "not_found", "message": "bounty not found" } }));
+    let request_id = r.headers["x-request-id"].to_str().unwrap().to_string();
+    assert!(!request_id.is_empty(), "every response carries a request id");
+    assert_eq!(r.body, json!({ "error": { "code": "not_found", "message": "bounty not found", "request_id": request_id } }));
     let h = &r.headers;
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(h["x-frame-options"], "DENY");
@@ -209,6 +211,27 @@ async fn every_response_carries_the_security_headers_and_errors_use_one_shape(po
     assert!(h["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
     let unknown = get(&e, "/nope").await;
     assert_eq!((unknown.status, unknown.body["error"]["code"].clone()), (StatusCode::NOT_FOUND, json!("not_found")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn request_ids_are_reused_when_well_formed_and_generated_otherwise(pool: PgPool) {
+    let e = env(pool, true, vec![]);
+    let supplied = "support-42";
+    let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-request-id", supplied.into())], None).await;
+    assert_eq!(r.headers["x-request-id"], supplied);
+    assert_eq!(r.body["error"]["request_id"], json!(supplied));
+
+    // Spaces are legal header bytes but not a safe id: replace it with a generated UUID.
+    let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-request-id", "not a valid id".into())], None).await;
+    let generated = r.headers["x-request-id"].to_str().unwrap().to_string();
+    assert_ne!(generated, "not a valid id");
+    assert_eq!(generated.len(), 36, "a generated UUID");
+    assert_eq!(r.body["error"]["request_id"], json!(generated));
+
+    // Webhook errors follow the same shape, even before a delivery id is known.
+    let denied = deliver(&e, "no-sig", "ping", "{}", None).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.body["error"]["request_id"].as_str(), denied.headers["x-request-id"].to_str().ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1206,6 +1229,14 @@ async fn a_dispute_can_be_rejected_with_a_note_once(pool: PgPool) {
     assert_eq!((row.status.as_str(), row.resolution_note.as_deref()), ("rejected", Some("no merit")));
     assert_eq!(call(&e.app, Method::POST, &uri, &admin.hdrs(true), Some(json!({ "note": "again" }))).await.status, StatusCode::CONFLICT);
     assert!(get_admin(&e, &admin, "/admin/disputes").await.body.as_array().unwrap().is_empty());
+
+    // #132: the arbiter's note is carried to GitHub by a durable, once-only comment job.
+    let jobs: Vec<(String, Value)> = sqlx::query_as("SELECT kind, payload FROM jobs").fetch_all(&pool).await.unwrap();
+    assert_eq!(jobs.len(), 1, "the rejected decision comments once, even after a repeated request");
+    assert_eq!(jobs[0].0, escrow_engine::jobs::DISPUTE_COMMENT);
+    assert_eq!(jobs[0].1["bountyId"], json!(4));
+    assert_eq!(jobs[0].1["note"], json!("no merit"));
+    assert_eq!(jobs[0].1["key"], json!(format!("rejected:{}", d.id)));
 }
 
 async fn get_admin(e: &Env, s: &Session, uri: &str) -> Resp {
@@ -1304,8 +1335,9 @@ async fn deliver(e: &Env, id: &str, event: &str, body: &str, sig: Option<String>
     let r = h.iter().fold(r, |r, (k, v)| r.header(*k, v)).body(Body::from(body.to_string())).unwrap();
     let resp = e.app.clone().oneshot(r).await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
-    Resp { status, headers: Default::default(), body: serde_json::from_str(&text).unwrap_or(Value::Null), text }
+    Resp { status, headers, body: serde_json::from_str(&text).unwrap_or(Value::Null), text }
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1324,6 +1356,51 @@ async fn a_signed_webhook_is_recorded_and_queued_exactly_once(pool: PgPool) {
     assert_eq!((deliveries, jobs), (1, 1));
     let payload: Value = sqlx::query_scalar("SELECT payload FROM jobs").fetch_one(&pool).await.unwrap();
     assert_eq!((payload["event"].as_str(), payload["payload"]["comment"]["body"].as_str()), (Some("issue_comment"), Some("/bounty 5")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn redelivery_of_a_failed_webhook_is_queued_again_but_success_and_queued_are_duplicates(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = r#"{"action":"created"}"#;
+    let sig = Some(sign_body(body));
+
+    // A delivery whose worker gave up is not a duplicate: GitHub's Redeliver button must work.
+    assert_eq!(deliver(&e, "failed-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    sqlx::query("UPDATE jobs SET status = 'dead', last_error = 'boom' WHERE dedupe_key = 'webhook:failed-1'").execute(&pool).await.unwrap();
+    escrow_db::webhooks::mark_processed(&pool, "failed-1", Some("boom")).await.unwrap();
+    let retry = deliver(&e, "failed-1", "ping", body, sig.clone()).await;
+    assert_eq!((retry.status, retry.body["queued"].clone()), (StatusCode::ACCEPTED, json!(true)));
+    let failed_error: Option<String> =
+        sqlx::query_scalar("SELECT error FROM webhook_deliveries WHERE id = 'failed-1'").fetch_one(&pool).await.unwrap();
+    assert!(failed_error.is_none(), "the terminal failure was cleared for the retry");
+    // The retry is now queued, so a third redelivery is a duplicate again.
+    let again = deliver(&e, "failed-1", "ping", body, sig.clone()).await;
+    assert_eq!((again.status, again.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    // A successfully processed delivery stays a duplicate.
+    assert_eq!(deliver(&e, "ok-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    sqlx::query("UPDATE jobs SET status = 'done' WHERE dedupe_key = 'webhook:ok-1'").execute(&pool).await.unwrap();
+    escrow_db::webhooks::mark_processed(&pool, "ok-1", None).await.unwrap();
+    let dup = deliver(&e, "ok-1", "ping", body, sig.clone()).await;
+    assert_eq!((dup.status, dup.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    // A delivery still waiting in the queue is a duplicate too.
+    assert_eq!(deliver(&e, "queued-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    let dup = deliver(&e, "queued-1", "ping", body, sig).await;
+    assert_eq!((dup.status, dup.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:failed-1'").fetch_one(&pool).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:ok-1'").fetch_one(&pool).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:queued-1'").fetch_one(&pool).await.unwrap(),
+        1
+    );
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
