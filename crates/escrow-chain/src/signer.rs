@@ -111,7 +111,8 @@ impl SignatureProvider for VaultTransitSigner {
     async fn public_key(&self) -> Result<[u8; 32], ChainError> {
         let url = format!("{}/v1/transit/keys/{}", self.addr, self.key);
         let read: KeyRead = self.call(|| self.http.get(url.as_str())).await?;
-        let latest = read.keys.get(&read.latest_version.to_string()).ok_or_else(|| ChainError::Decode("vault key has no latest version".into()))?;
+        let latest =
+            read.keys.get(&read.latest_version.to_string()).ok_or_else(|| ChainError::Decode("vault key has no latest version".into()))?;
         decode_public_key(&latest.public_key)
     }
 

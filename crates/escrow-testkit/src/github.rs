@@ -91,11 +91,23 @@ impl FakeGithub {
                     draft,
                     state: state.into(),
                     merged: false,
+                    merged_at: None,
                     head: escrow_github::api::Head { sha: sha.into() },
                     user: escrow_github::PullUser { id: 1, login: "dev".into(), kind: "User".into() },
                     created_at: created,
                 },
             );
+        });
+    }
+
+    /// Marks a stored pull request merged, as GitHub reports it after the merge.
+    pub fn merge_pull(&self, repo: &str, number: i32, at: DateTime<Utc>) {
+        self.with(|s| {
+            if let Some(p) = s.pulls.get_mut(&(repo.to_string(), number)) {
+                p.state = "closed".into();
+                p.merged = true;
+                p.merged_at = Some(at);
+            }
         });
     }
 

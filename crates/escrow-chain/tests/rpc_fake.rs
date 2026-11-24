@@ -181,7 +181,7 @@ async fn build_fund_uses_the_next_sequence_number_and_all_seven_arguments() {
         other => panic!("unexpected {other}"),
     })
     .await;
-    let xdr = fake
+    let built = fake
         .chain()
         .build_fund(&FundParams {
             maintainer: maintainer.clone(),
@@ -194,10 +194,13 @@ async fn build_fund_uses_the_next_sequence_number_and_all_seven_arguments() {
         })
         .await
         .unwrap();
-    let e = decode_envelope(&xdr);
+    let e = decode_envelope(&built.xdr);
     assert!(e.signatures.is_empty(), "the server must never sign a user's transaction");
     assert_eq!(e.tx.seq_num.0, 101);
     assert_eq!(e.tx.fee, 100 + 50_000 + 10_000);
+    assert_eq!(built.valid_until, escrow_chain::tx::max_time(&e.tx).unwrap(), "the expiry must come from the XDR");
+    let now = escrow_chain::tx::now_secs();
+    assert!((now + 590..=now + 600).contains(&built.valid_until), "a wallet gets ten minutes to sign");
     assert!(matches!(e.tx.ext, TransactionExt::V1(_)));
     let call = invoked(&e);
     assert_eq!(call.function_name.to_utf8_string_lossy(), "fund_bounty");
@@ -227,8 +230,8 @@ async fn resolve_encodes_a_missing_winner_as_void() {
         _ => sim_ok(None),
     })
     .await;
-    let xdr = fake.chain().build_resolve(&a.address(), 4, None, 0).await.unwrap();
-    let call_args = decode_envelope(&xdr);
+    let built = fake.chain().build_resolve(&a.address(), 4, None, 0).await.unwrap();
+    let call_args = decode_envelope(&built.xdr);
     let args = &invoked(&call_args).args;
     assert_eq!((args[2].clone(), args[3].clone()), (ScVal::Void, ScVal::U32(0)));
 }
@@ -392,6 +395,51 @@ async fn an_unreachable_rpc_is_a_transient_error_that_does_not_leak_the_url() {
     let e = c.latest_ledger().await.unwrap_err();
     assert!(e.is_transient());
     assert!(!e.to_string().contains("secret-api-key"));
+}
+
+#[tokio::test]
+async fn read_methods_retry_transient_failures_and_succeed() {
+    let attempts = Arc::new(Mutex::new(0usize));
+    let attempts2 = attempts.clone();
+    let fake = Fake::start(move |method, _| {
+        assert_eq!(method, "getEvents");
+        let mut n = attempts2.lock().unwrap();
+        *n += 1;
+        if *n < 3 {
+            json!({ "__error": { "code": -32603, "message": "transient failure" } })
+        } else {
+            json!({ "events": [], "cursor": "1-0", "latestLedger": 42 })
+        }
+    })
+    .await;
+    let page = fake.chain().events_from_ledger(10, 100).await.unwrap();
+    assert_eq!(page.latest_ledger, 42);
+    assert_eq!(fake.calls("getEvents").len(), 3);
+}
+
+#[tokio::test]
+async fn read_methods_stop_retrying_after_bounded_attempts() {
+    let fake = Fake::start(|_, _| json!({ "__error": { "code": -32603, "message": "still down" } })).await;
+    let err = fake.chain().latest_ledger().await.unwrap_err();
+    assert!(err.is_transient());
+    assert_eq!(fake.calls("getLatestLedger").len(), 3);
+}
+
+#[tokio::test]
+async fn send_transaction_is_never_retried_automatically() {
+    let (secret, r) = signer(9);
+    let (_, w) = signer(2);
+    let acct = account_entry(&r.address(), 1, 1);
+    let fake = Fake::start(move |method, _| match method {
+        "getLedgerEntries" => acct.clone(),
+        "simulateTransaction" => sim_ok(None),
+        "sendTransaction" => json!({ "__error": { "code": -32603, "message": "temporary" } }),
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    let err = Relayer::new(fake.chain(), &secret).unwrap().submit_release(1, &w.address()).await.unwrap_err();
+    assert!(err.is_transient());
+    assert_eq!(fake.calls("sendTransaction").len(), 1);
 }
 
 #[test]

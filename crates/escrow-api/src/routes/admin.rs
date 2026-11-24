@@ -7,6 +7,7 @@ use crate::{
     extract::{ApiJson, ClientIp},
     routes::{
         auth::mutation_limit,
+        prepared_tx,
         public::{Detail, detail_of},
     },
     session::{Authed, require_user},
@@ -32,7 +33,7 @@ async fn admin(s: &AppState, h: &HeaderMap, ip: &ClientIp, mutating: bool) -> Ap
         return Err(ApiError::forbidden("forbidden", "admins only"));
     }
     if mutating {
-        mutation_limit(s, h, ip, 30)?;
+        mutation_limit(s, Some(&a), ip, 30)?;
     }
     Ok(a)
 }
@@ -99,9 +100,9 @@ pub async fn open_onchain(
     if d.status != "requested" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}", d.status)));
     }
-    let xdr = s.txb.build_open_dispute(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0)).await?;
+    let built = s.txb.build_open_dispute(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0)).await?;
     audit_log(&s, &a, "dispute.open_onchain.build", format!("dispute:{}", d.id), json!({ "bounty": d.bounty_id.to_string() })).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -134,10 +135,10 @@ pub async fn resolve_build(
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}; open it on chain first", d.status)));
     }
     let winner = if b.winner_bps > 0 { b.winner.as_deref() } else { None };
-    let xdr = s.txb.build_resolve(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0), winner, b.winner_bps).await?;
+    let built = s.txb.build_resolve(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0), winner, b.winner_bps).await?;
     disputes::set_note(&s.db.pool, &d.id, &b.note).await?;
     audit_log(&s, &a, "dispute.resolve.build", format!("dispute:{}", d.id), json!({ "winner": b.winner, "bps": b.winner_bps })).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -207,11 +208,7 @@ pub async fn list_payouts(
     }
     let limit = match q.limit.as_deref() {
         None => 50,
-        Some(l) => l
-            .parse::<i64>()
-            .ok()
-            .filter(|n| (1..=100).contains(n))
-            .ok_or_else(|| ApiError::bad_request("invalid limit"))?,
+        Some(l) => l.parse::<i64>().ok().filter(|n| (1..=100).contains(n)).ok_or_else(|| ApiError::bad_request("invalid limit"))?,
     };
     let filter = payouts::ListFilter { status, bounty_id, cursor: q.cursor, limit };
     let mut rows = payouts::list(&s.db.pool, &filter).await?;

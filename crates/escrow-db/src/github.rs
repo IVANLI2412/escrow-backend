@@ -98,16 +98,20 @@ pub async fn rename_repo<'e>(ex: impl PgExecutor<'e>, id: i64, full_name: &str) 
 }
 
 pub async fn get_repo<'e>(ex: impl PgExecutor<'e>, id: i64) -> Result<Option<Repo>, sqlx::Error> {
-    sqlx::query_as("SELECT id, installation_id, full_name, is_private FROM repos WHERE id = $1").bind(id).fetch_optional(ex).await
+    sqlx::query_as("SELECT id, installation_id, full_name, is_private, suspended_at FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(ex)
+        .await
 }
 
 pub async fn list_repos<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Repo>, sqlx::Error> {
-    sqlx::query_as("SELECT id, installation_id, full_name, is_private FROM repos ORDER BY full_name").fetch_all(ex).await
+    sqlx::query_as("SELECT id, installation_id, full_name, is_private, suspended_at FROM repos ORDER BY full_name").fetch_all(ex).await
 }
 
 /// Whether AI reviews are on for a repository (on unless a `repo_settings` row turns them off).
 pub async fn ai_reviews_enabled<'e>(ex: impl PgExecutor<'e>, repo_id: i64) -> Result<bool, sqlx::Error> {
-    let v: Option<bool> = sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
+    let v: Option<bool> =
+        sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
     Ok(v.unwrap_or(true))
 }
 

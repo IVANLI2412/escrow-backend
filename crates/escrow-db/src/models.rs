@@ -53,6 +53,7 @@ pub struct Repo {
     pub installation_id: i64,
     pub full_name: String,
     pub is_private: bool,
+    pub suspended_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]

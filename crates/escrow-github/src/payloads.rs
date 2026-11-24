@@ -39,6 +39,8 @@ pub struct InstallationEvent {
     pub repositories: Vec<RepoRef>,
     #[serde(default)]
     pub repositories_added: Vec<RepoRef>,
+    #[serde(default)]
+    pub repositories_removed: Vec<RepoId>,
 }
 
 /// The `repository` webhook. Used for `renamed` and `transferred`, where `repository.full_name` is already

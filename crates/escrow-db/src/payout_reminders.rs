@@ -53,6 +53,7 @@ pub async fn record<'e>(ex: impl PgExecutor<'e>, payout_id: &str, stage: &str) -
 
 /// Whether reminders are on for a repository (on unless a `repo_settings` row turns them off).
 pub async fn wallet_reminders_enabled<'e>(ex: impl PgExecutor<'e>, repo_id: i64) -> Result<bool, sqlx::Error> {
-    let v: Option<bool> = sqlx::query_scalar("SELECT wallet_reminders FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
+    let v: Option<bool> =
+        sqlx::query_scalar("SELECT wallet_reminders FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
     Ok(v.unwrap_or(true))
 }
