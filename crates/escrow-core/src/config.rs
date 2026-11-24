@@ -87,6 +87,13 @@ pub struct Config {
     pub token_max: i128,
     pub min_days: u32,
     pub max_days: u32,
+    /// How long a single Soroban RPC call is allowed to take, in seconds.
+    /// Self-hosted and paid providers vary; operators tune this per deployment (#112).
+    pub stellar_rpc_timeout_secs: u64,
+    /// How long `Relayer::wait_for_tx` polls for a submitted transaction to reach a
+    /// terminal state before giving up with `TxOutcome::NotFound` (#113). Also used by
+    /// the restore flow when archived contract state has to be re-established first.
+    pub relayer_confirm_wait_secs: u64,
     pub indexer_interval_secs: u64,
     pub indexer_lookback_ledgers: u32,
     pub review_debounce_secs: u64,
@@ -340,6 +347,20 @@ impl Config {
             r.errors.push(format!("AI_TIMEOUT_SECS: must be between 1 and {} (below the {JOB_LEASE_SECS}s job lease)", JOB_LEASE_SECS - 1));
         }
 
+        // #112: the default (20 s) matches the old hard-coded value, so an existing deploy
+        // that does not set the variable keeps its behaviour. A value of 0 is a configuration
+        // mistake (reqwest treats 0 as "no timeout", which is the opposite of what people want).
+        let stellar_rpc_timeout_secs = r.number("STELLAR_RPC_TIMEOUT_SECS", 20u64);
+        if stellar_rpc_timeout_secs == 0 {
+            r.errors.push("STELLAR_RPC_TIMEOUT_SECS: must be at least 1".into());
+        }
+        // #113: a submit's validity window is `RELAYER_TX_VALID_SECS` (120 s); the wait must not
+        // outlast that or the relayer polls a transaction the network has already dropped.
+        let relayer_confirm_wait_secs = r.number("RELAYER_CONFIRM_WAIT_SECS", 60u64);
+        if relayer_confirm_wait_secs == 0 || relayer_confirm_wait_secs > 120 {
+            r.errors.push("RELAYER_CONFIRM_WAIT_SECS: must be between 1 and 120 (the submitted-tx validity window)".into());
+        }
+
         let ai_price_input = r.number("AI_PRICE_INPUT_PER_MTOK", 3.0f64);
         let ai_price_output = r.number("AI_PRICE_OUTPUT_PER_MTOK", 15.0f64);
         if ai_price_input <= 0.0 || ai_price_output <= 0.0 {
@@ -382,6 +403,8 @@ impl Config {
             token_max,
             min_days,
             max_days,
+            stellar_rpc_timeout_secs,
+            relayer_confirm_wait_secs,
             indexer_interval_secs: r.number("INDEXER_INTERVAL_SECS", 5u64),
             indexer_lookback_ledgers: r.number("INDEXER_LOOKBACK_LEDGERS", 1000u32),
             review_debounce_secs: r.number("REVIEW_DEBOUNCE_SECS", 300u64),
