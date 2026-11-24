@@ -434,11 +434,11 @@ impl GithubApi for GithubClient {
 
     async fn set_bounty_label(&self, installation: i64, repo: &str, issue: i32, label: &str) -> Result<(), GithubError> {
         let repo = repo_ok(repo)?;
-        let issue = positive(issue.into(), "issue")?;
         if !LABEL.is_match(label) {
             return Err(GithubError::Invalid("invalid label".into()));
         }
-        self.delete_bounty_labels(installation, repo, issue, Some(label)).await?;
+        self.delete_bounty_labels(installation, &repo, issue, Some(label)).await?;
+        let issue = positive(issue.into(), "issue")?;
         let made = self
             .call(installation, reqwest::Method::POST, &format!("/repos/{repo}/labels"), Some(&json!({ "name": label, "color": "c9f25d" })))
             .await?;
