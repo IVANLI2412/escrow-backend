@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use escrow_api::{AppState, limiter::RateLimiter, login::GithubLogin, metrics::Metrics, router, state::ApiConfig};
 use escrow_core::{
     BountyStatus,
-    oauth::{OAUTH_COOKIE, clear_cookie},
+    oauth::{OAUTH_COOKIE, SESSION_COOKIE, clear_cookie},
     security::{csrf_token, hash_session_id, hmac_hex, sep53_hash},
 };
 use escrow_db::{Db, MIGRATOR, bounties, disputes, intents, payouts, prs, sessions, users};
@@ -62,10 +62,10 @@ struct Env {
 }
 
 fn env(pool: PgPool, with_login: bool, admins: Vec<i64>) -> Env {
-    env_with_lag(pool, with_login, admins, true)
+    env_with_lag(pool, with_login, admins, true, false)
 }
 
-fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_lag: bool) -> Env {
+fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_lag: bool, secure_cookies: bool) -> Env {
     let db = Db::from_pool(pool);
     let chain = Arc::new(FakeChain::default());
     *chain.ledger.lock().unwrap() = 1000;
@@ -83,7 +83,7 @@ fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_
             webhook_secret: WEBHOOK_SECRET.into(),
             api_public_url: "http://localhost:3001".into(),
             web_public_url: "http://localhost:3000".into(),
-            secure_cookies: false,
+            secure_cookies,
             admin_github_ids: admins,
             trust_proxy: false,
             metrics_token: None,
@@ -183,7 +183,7 @@ async fn health_reports_ok_and_503_when_the_indexer_is_far_behind(pool: PgPool) 
     assert_eq!(lagging.body["indexerLagLedgers"], 900);
 
     // API-only mode (escrowd serve): indexer lag is still reported but does not fail /health
-    let serve_env = env_with_lag(pool.clone(), true, vec![], false);
+    let serve_env = env_with_lag(pool.clone(), true, vec![], false, false);
     let serve_health = get(&serve_env, "/health").await;
     assert_eq!(serve_health.status, StatusCode::OK);
     assert_eq!((serve_health.body["ok"].clone(), serve_health.body["indexerLagLedgers"].clone()), (json!(true), json!(900)));
@@ -442,6 +442,19 @@ fn cookie_pair(set_cookie: &str) -> String {
     set_cookie.split(';').next().unwrap().to_string()
 }
 
+fn cookie_name(set_cookie: &str) -> &str {
+    set_cookie.split('=').next().unwrap().trim()
+}
+
+/// Every attribute of a `Set-Cookie` except `Max-Age` (login keeps the cookie for its TTL, logout
+/// expires it immediately, so only the remaining attributes must agree).
+fn cookie_attributes(set_cookie: &str) -> Vec<String> {
+    let mut attrs: Vec<String> =
+        set_cookie.split(';').skip(1).map(str::trim).filter(|p| !p.starts_with("Max-Age")).map(str::to_string).collect();
+    attrs.sort();
+    attrs
+}
+
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn the_full_github_sign_in_flow_creates_a_session(pool: PgPool) {
     let e = env(pool.clone(), true, vec![583231]);
@@ -464,7 +477,7 @@ async fn the_full_github_sign_in_flow_creates_a_session(pool: PgPool) {
     let cookies = set_cookies(&done);
     let sess = cookies.iter().find(|c| c.starts_with("se_session=")).unwrap();
     assert!(sess.contains("HttpOnly") && sess.contains("Max-Age=2592000"));
-    assert!(cookies.contains(&clear_cookie(OAUTH_COOKIE)), "the one-time state cookie is cleared");
+    assert!(cookies.contains(&clear_cookie(OAUTH_COOKIE, false)), "the one-time state cookie is cleared");
 
     let me = call(&e.app, Method::GET, "/auth/me", &[("cookie", cookie_pair(sess))], None).await;
     assert_eq!((me.status, me.body["login"].as_str(), me.body["isAdmin"].clone()), (StatusCode::OK, Some("octocat"), json!(true)));
@@ -558,6 +571,39 @@ async fn sessions_csrf_and_logout(pool: PgPool) {
         StatusCode::UNAUTHORIZED,
         "the session is gone server-side"
     );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn logout_clears_the_session_cookie_with_the_same_attributes_as_login(pool: PgPool) {
+    // secure_cookies changes the Set-Cookie attributes, so the clearing cookie must follow it too
+    for secure in [false, true] {
+        let e = env_with_lag(pool.clone(), true, vec![], true, secure);
+
+        let start = get(&e, "/auth/login").await;
+        let oauth_cookie = cookie_pair(&set_cookies(&start).into_iter().find(|c| c.starts_with("se_oauth=")).unwrap());
+        let state = start.headers[header::LOCATION].to_str().unwrap().split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let done =
+            call(&e.app, Method::GET, &format!("/auth/callback?code=good-code&state={state}"), &[("cookie", oauth_cookie)], None).await;
+        let login_cookie = set_cookies(&done).into_iter().find(|c| c.starts_with("se_session=")).unwrap();
+        assert_eq!(login_cookie.contains("Secure"), secure, "login cookie Secure flag follows secure_cookies");
+
+        let sid = cookie_pair(&login_cookie).strip_prefix("se_session=").unwrap().to_string();
+        let out = call(
+            &e.app,
+            Method::POST,
+            "/auth/logout",
+            &[("cookie", cookie_pair(&login_cookie)), ("x-csrf-token", csrf_token(CSRF, &sid))],
+            None,
+        )
+        .await;
+        assert_eq!(out.status, StatusCode::OK);
+        let cleared = set_cookies(&out).into_iter().find(|c| c.starts_with("se_session=")).unwrap();
+
+        assert_eq!(cookie_name(&cleared), SESSION_COOKIE);
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("Secure") == secure, "clearing cookie Secure flag follows secure_cookies: {cleared}");
+        assert_eq!(cookie_attributes(&cleared), cookie_attributes(&login_cookie), "cleared cookie attributes must match login");
+    }
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1288,6 +1334,24 @@ async fn mutations_are_rate_limited_per_user_not_shared(pool: PgPool) {
     assert_eq!(hit(&b).await, StatusCode::BAD_REQUEST, "another user is unaffected");
     let r = call(&e.app, Method::POST, "/wallet/challenge", &a.hdrs(true), Some(json!({ "address": "GBAD" }))).await;
     assert_eq!(r.body["error"]["code"], "rate_limited");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_users_sessions_share_one_mutation_budget(pool: PgPool) {
+    let e = env(pool, true, vec![]);
+    // signing in twice creates two sessions for the same GitHub user
+    let s1 = signed_in(&e, 1, "a", None, false).await;
+    let s2 = signed_in(&e, 1, "a", None, false).await;
+    assert_ne!(s1.cookie, s2.cookie, "each sign-in gets its own session");
+    let hit = |s: &Session| {
+        let (app, h) = (e.app.clone(), s.hdrs(true));
+        async move { call(&app, Method::POST, "/wallet/challenge", &h, Some(json!({ "address": "GBAD" }))).await.status }
+    };
+    for _ in 0..20 {
+        assert_eq!(hit(&s1).await, StatusCode::BAD_REQUEST);
+    }
+    // the budget is keyed by user, so a fresh session cannot mint a new allowance
+    assert_eq!(hit(&s2).await, StatusCode::TOO_MANY_REQUESTS, "the second session shares the user's spent budget");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

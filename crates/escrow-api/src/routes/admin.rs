@@ -32,7 +32,7 @@ async fn admin(s: &AppState, h: &HeaderMap, ip: &ClientIp, mutating: bool) -> Ap
         return Err(ApiError::forbidden("forbidden", "admins only"));
     }
     if mutating {
-        mutation_limit(s, h, ip, 30)?;
+        mutation_limit(s, Some(&a), ip, 30)?;
     }
     Ok(a)
 }
