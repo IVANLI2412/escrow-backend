@@ -189,16 +189,32 @@ impl IssueCommenter for GithubCommenter {
     }
 }
 
+/// What one reminder pass did: the reminders that went out and the ones whose comment failed, each as `kind:bounty_id`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReminderReport {
+    pub sent: Vec<String>,
+    /// Failed comments are not recorded as sent, so the next pass retries them.
+    pub failed: Vec<String>,
+}
+
+impl ReminderReport {
+    /// True when the pass neither sent nor failed anything.
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_empty() && self.failed.is_empty()
+    }
+}
+
 /// Refund reminders: one 48 h before the refund window opens (deadline + grace), one when it opens.
 /// Each is sent at most once, recorded in the audit log AFTER the comment succeeds (a failed comment is retried next tick).
+/// A comment that fails (a revoked installation, say) is logged and reported in `failed`; it does not stop the other bounties.
 pub async fn send_refund_reminders(
     db: &Db,
     commenter: &dyn IssueCommenter,
     grace: Duration,
     web_url: &str,
     now: DateTime<Utc>,
-) -> Result<Vec<String>, EngineError> {
-    let mut sent = vec![];
+) -> Result<ReminderReport, EngineError> {
+    let mut report = ReminderReport::default();
     for b in bounties::open_ones(&db.pool).await? {
         let opens_at = b.deadline + grace;
         let kind = if now >= opens_at {
@@ -222,11 +238,15 @@ pub async fn send_refund_reminders(
                 "The refund window for this bounty is now open. The maintainer can reclaim the funds at {web_url}/me. A merged PR can still be released until then."
             )
         };
-        commenter.comment(b.id, &body).await?;
+        if let Err(e) = commenter.comment(b.id, &body).await {
+            tracing::warn!(bounty = b.id, kind, error = %e, "refund reminder failed; the other bounties still get theirs");
+            report.failed.push(format!("{kind}:{}", b.id));
+            continue;
+        }
         audit::log(&db.pool, "system", &action, &target, &serde_json::json!({})).await?;
-        sent.push(format!("{kind}:{}", b.id));
+        report.sent.push(format!("{kind}:{}", b.id));
     }
-    Ok(sent)
+    Ok(report)
 }
 
 /// Wallet reminder stages after a PR merge while its payout waits for a wallet: name and hours after the merge.
