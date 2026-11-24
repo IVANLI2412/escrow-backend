@@ -108,7 +108,6 @@ pub async fn count_anomalies_24h<'e>(
     .fetch_one(ex)
     .await
 }
-}
 
 /// The first row where the chain is broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
