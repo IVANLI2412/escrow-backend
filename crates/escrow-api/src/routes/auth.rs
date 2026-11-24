@@ -5,7 +5,7 @@ use crate::{
     extract::{ApiJson, ClientIp},
     metrics::Metrics,
     routes::public::{EarningsQuery, earnings_page},
-    session::{self, limit_key, require_user},
+    session::{self, Authed, limit_key, require_user},
     state::AppState,
     wallet,
 };
@@ -16,7 +16,10 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use escrow_core::{
-    oauth::{OAUTH_COOKIE, StateError, clear_cookie, cookie_value, safe_next, session_cookie, start_login, state_cookie, verify_state},
+    oauth::{
+        OAUTH_COOKIE, SESSION_COOKIE, StateError, clear_cookie, cookie_value, safe_next, session_cookie, start_login, state_cookie,
+        verify_state,
+    },
     security::csrf_token,
 };
 use escrow_db::{bounties, users};
@@ -26,9 +29,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Instant;
 
-/// Per-user (or per-IP) budget for state-changing calls.
-pub fn mutation_limit(s: &AppState, h: &HeaderMap, ip: &ClientIp, max: u32) -> ApiResult<()> {
-    if s.limiter.check(&format!("m:{}", limit_key(h, &ip.0)), max, Instant::now()) {
+/// Per-user budget for state-changing calls: keyed by the verified user, or by address when there is
+/// no signed-in user. Pass the `Authed` from `require_user`; never key off an unverified cookie.
+pub fn mutation_limit(s: &AppState, user: Option<&Authed>, ip: &ClientIp, max: u32) -> ApiResult<()> {
+    if s.limiter.check(&format!("m:{}", limit_key(user, &ip.0)), max, Instant::now()) {
         Ok(())
     } else {
         Metrics::inc(&s.metrics.http_rate_limited);
@@ -65,10 +69,10 @@ pub struct CallbackQuery {
 
 pub async fn callback(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> ApiResult<Response> {
     let login = s.login.as_ref().ok_or_else(login_not_configured)?;
-    let clear = || [(header::SET_COOKIE, clear_cookie(OAUTH_COOKIE))];
+    let clear = || [(header::SET_COOKIE, clear_cookie(OAUTH_COOKIE, s.cfg.secure_cookies))];
     let fail = |status, code: &str, msg: &str| {
         let mut r = ApiError::new(status, code, msg).into_response();
-        r.headers_mut().append(header::SET_COOKIE, clear_cookie(OAUTH_COOKIE).parse().expect("ascii"));
+        r.headers_mut().append(header::SET_COOKIE, clear_cookie(OAUTH_COOKIE, s.cfg.secure_cookies).parse().expect("ascii"));
         Ok(r)
     };
 
@@ -121,7 +125,8 @@ pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json
 pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let a = require_user(&s, &headers, true).await?;
     session::destroy(&s.db, &a.session_id).await?;
-    Ok(([(header::SET_COOKIE, "se_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")], Json(json!({ "ok": true }))).into_response())
+    let clearing = clear_cookie(SESSION_COOKIE, s.cfg.secure_cookies).parse().expect("ascii");
+    Ok(([(header::SET_COOKIE, clearing)], Json(json!({ "ok": true }))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -136,7 +141,7 @@ pub async fn wallet_challenge(
     ApiJson(b): ApiJson<AddressBody>,
 ) -> ApiResult<Json<wallet::Challenge>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     Ok(Json(wallet::create_challenge(&s.db, &a.user.id, &b.address, (s.now)()).await?))
 }
 
@@ -154,7 +159,7 @@ pub async fn wallet_verify(
     ApiJson(b): ApiJson<VerifyBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     let address = wallet::verify_challenge(&s.db, &a.user.id, &b.challenge_id, &b.signature, (s.now)()).await?;
     Metrics::inc(&s.metrics.wallets_linked);
     // a payout that was waiting for this wallet continues now; the link itself has already succeeded
