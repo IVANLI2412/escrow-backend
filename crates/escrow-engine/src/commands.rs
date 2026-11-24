@@ -49,6 +49,7 @@ const WRITERS: [&str; 3] = ["admin", "maintain", "write"];
 const HELP: &str = "**SkillEscrow commands**\n\
 - `/bounty <amount> [USDC|XLM] [<days>d]` fund this issue, e.g. `/bounty 50 USDC 14d` (needs write access)\n\
 - `/bounty dispute <reason>` flag a problem on a bountied issue\n\
+- `/bounty review` request an AI review of a PR (PRs only, needs write access)\n\
 - `/bounty help`";
 
 /// What happened, as a short label for logs and tests. User mistakes get a friendly reply and are not errors;
@@ -141,7 +142,7 @@ pub async fn handle_issue_comment(d: &CommandDeps, ev: &IssueCommentEvent) -> Re
                 &serde_json::json!({ "dispute": dsp.id }),
             )
             .await?;
-            let mut text = String::from("Dispute recorded. A human will review this within 48 hours.");
+            let mut text = format!("Dispute recorded. A human will review this within {} hours.", escrow_core::DISPUTE_RESPONSE_HOURS);
             if truncated {
                 text.push_str(&format!(
                     "\n\nYour reason was longer than {MAX_DISPUTE_REASON_CHARS} characters, so it was shortened to the first {MAX_DISPUTE_REASON_CHARS}. Post any further detail in a follow-up comment."

@@ -3,6 +3,7 @@ mod common;
 use chrono::{Duration, Utc};
 use common::*;
 use escrow_chain::ChainError;
+use escrow_core::PayoutStatus;
 use escrow_db::{MIGRATOR, audit, bounties, disputes, github, intents, jobs, payouts, prs, untracked, users, webhooks};
 use escrow_engine::indexer::{
     CURSOR_ID, FAILURE_ALERT_THRESHOLD, MAX_PAGES, apply_untracked_for_repo, min_untracked_ledger_for_repo, poll_once, run,
@@ -143,7 +144,7 @@ async fn a_release_closes_the_bounty_confirms_the_payout_and_finds_the_winner_by
     poll_once(&w.indexer()).await.unwrap();
     // a relayer payout is mid-flight when the chain confirms it
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
-    payouts::release_from_pending(&pool, &p.id, "QUEUED", &win).await.unwrap();
+    payouts::release_from_pending(&pool, &p.id, PayoutStatus::Queued, &win).await.unwrap();
     payouts::mark_submitted(&pool, &p.id, "relayerhash").await.unwrap();
 
     let rel = released(4, &win, &addr(9), 105, 2);
@@ -320,15 +321,17 @@ async fn anomaly_writes_audit_entry_with_details(pool: PgPool) {
     w.events.push_page(vec![funded(&fund(4, &m, 3), 100, 1)], &event_id(100, 1), 100);
     poll_once(&w.indexer()).await.unwrap();
 
-    // Release for a refunded bounty = anomaly
-    w.events.push_page(vec![refunded(4, 101, 1), released(4, &addr(2), &addr(9), 102, 1)], &event_id(102, 1), 102);
+    w.events.push_page(vec![refunded(4, 101, 1)], &event_id(101, 1), 101);
+    poll_once(&w.indexer()).await.unwrap();
+
+    w.events.push_page(vec![released(4, &addr(2), &addr(9), 102, 1)], &event_id(102, 1), 102);
     let r = poll_once(&w.indexer()).await.unwrap();
     assert_eq!((r.applied, r.anomalies), (0, 1));
 
     let audit_rows = audit::recent(&pool, 10).await.unwrap();
     let anomaly_audit = audit_rows.iter().find(|a| a.action == "anomaly_detected").expect("anomaly audit entry should exist");
     let data = &anomaly_audit.data;
-    assert_eq!(data["eventId"], "0000004294967296-0000000001"); // ledger 102, n=1
+    assert_eq!(data["eventId"], event_id(102, 1));
     assert_eq!(data["kind"], "released");
     assert_eq!(data["bountyId"], 4);
     assert_eq!(data["storedStatus"], "REFUNDED");
@@ -388,7 +391,7 @@ async fn poll_report_caught_up_false_when_max_pages_reached(pool: PgPool) {
     // Create more than MAX_PAGES pages of events (each page has 1 event, PAGE_LIMIT=200)
     for i in 0..MAX_PAGES + 10 {
         let ledger = 1000 + i as u32;
-        w.events.push_page(vec![funded(&fund(100 + i as u64, &m, 1), ledger, 1)], &event_id(ledger, 1), ledger);
+        w.events.push_page(vec![funded(&fund(100 + i as u64, &m, 1), ledger, 1)], &event_id(ledger, 1), 10_000);
     }
     // The last page should have the latest_ledger far ahead
     w.events.push_page(vec![], &event_id(10_000, 0), 10_000);
@@ -407,7 +410,7 @@ async fn run_polls_immediately_when_not_caught_up(pool: PgPool) {
     // Create events spanning more than MAX_PAGES
     for i in 0..MAX_PAGES + 5 {
         let ledger = 1000 + i as u32;
-        w.events.push_page(vec![funded(&fund(200 + i as u64, &m, 1), ledger, 1)], &event_id(ledger, 1), ledger);
+        w.events.push_page(vec![funded(&fund(200 + i as u64, &m, 1), ledger, 1)], &event_id(ledger, 1), 10_000);
     }
     w.events.push_page(vec![], &event_id(10_000, 0), 10_000);
 

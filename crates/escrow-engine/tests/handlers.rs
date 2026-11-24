@@ -4,7 +4,7 @@ use chrono::{Duration, Utc};
 use common::*;
 use escrow_core::BountyStatus;
 use escrow_db::{MIGRATOR, audit, bounties, disputes, github, intents, payouts, prs, users};
-use escrow_engine::{EngineError, dispatch::dispatch_webhook};
+use escrow_engine::{EngineError, dispatch::dispatch_webhook, pulls::recover_missed_merges};
 use escrow_github::GithubError;
 use escrow_testkit::seed;
 use serde_json::{Value, json};
@@ -147,7 +147,7 @@ async fn help_and_usage_errors_reply_with_the_command_list(pool: PgPool) {
     assert_eq!(run(&w, "issue_comment", &say("/bounty help", "stranger")).await.unwrap(), "help");
     assert_eq!(run(&w, "issue_comment", &say("/bounty fifty", "stranger")).await.unwrap(), "error");
     let b = w.gh.bodies();
-    assert!(b[0].contains("SkillEscrow commands") && b[1].contains("Invalid amount \"fifty\"") && b[1].contains("SkillEscrow commands"));
+    assert!(b[0].contains("SkillEscrow commands") && b[0].contains("/bounty review") && b[1].contains("Invalid amount \"fifty\"") && b[1].contains("SkillEscrow commands"));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -183,7 +183,7 @@ async fn disputes_come_only_from_the_maintainer_or_a_linked_pr_author(pool: PgPo
         (900, "it was reviewed unfairly", "requested")
     );
     assert!(audit::exists(&pool, "dispute.requested", "bounty:4").await.unwrap());
-    assert!(w.gh.bodies().last().unwrap().contains("A human will review this within 48 hours"));
+    assert!(w.gh.bodies().last().unwrap().contains(&format!("A human will review this within {} hours", escrow_core::DISPUTE_RESPONSE_HOURS)));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -409,6 +409,63 @@ async fn the_second_merged_pr_gets_no_second_payout(pool: PgPool) {
     assert!(w.gh.bodies().iter().any(|b| b.contains("already claimed")));
 }
 
+// #140: a merge whose `pull_request` webhook never arrived is found by the periodic check and paid once.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_merge_whose_webhook_was_missed_is_recovered_and_paid_once(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    fund_bounty(&w, 4, 3).await;
+    seed::user(&w.db, 900, "dev", Some("GCONTRIBUTOR")).await;
+    run(&w, "pull_request", &pr_event("opened", 7, 100, 900, "Closes #3", false, false, "open")).await.unwrap();
+    // the PR is merged on GitHub, but the "closed" delivery is lost
+    w.gh.set_pull(seed::REPO, 7, "abc1234", "fix", "Closes #3", false, "open", Utc::now());
+    w.gh.merge_pull(seed::REPO, 7, Utc::now());
+    assert!(payouts::for_bounty(&pool, 4).await.unwrap().is_none());
+
+    let sweep = recover_missed_merges(&w.pulls(None), w.gh.as_ref(), None, 25).await.unwrap();
+    assert_eq!((sweep.checked, sweep.merged.as_slice(), sweep.next_after), (1, &[100][..], None));
+    let p = payouts::for_bounty(&pool, 4).await.unwrap().unwrap();
+    assert_eq!((p.status.as_str(), p.winner_address.as_deref(), p.pr_number, p.winner_github_id), ("QUEUED", Some("GCONTRIBUTOR"), 7, 900));
+    let pr = prs::get(&pool, 100).await.unwrap().unwrap();
+    assert_eq!(pr.state, "merged");
+    assert!(pr.merged_at.is_some());
+
+    // the next pass has nothing left to check, and a late webhook redelivery pays nothing more
+    assert_eq!(recover_missed_merges(&w.pulls(None), w.gh.as_ref(), None, 25).await.unwrap().checked, 0);
+    run(&w, "pull_request", &pr_event("closed", 7, 100, 900, "Closes #3", true, false, "closed")).await.unwrap();
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM payouts").fetch_one(&pool).await.unwrap(), 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn merge_recovery_records_unmerged_closes_and_walks_in_batches(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    fund_bounty(&w, 4, 3).await;
+    for (id, n) in [(100, 7), (101, 8), (102, 9)] {
+        run(&w, "pull_request", &pr_event("opened", n, id, 900, "Closes #3", false, false, "open")).await.unwrap();
+        w.gh.set_pull(seed::REPO, n, "abc1234", "fix", "Closes #3", false, "open", Utc::now());
+    }
+    w.gh.set_pull(seed::REPO, 8, "abc1234", "fix", "Closes #3", false, "closed", Utc::now());
+
+    // oldest first, two at a time
+    let first = recover_missed_merges(&w.pulls(None), w.gh.as_ref(), None, 2).await.unwrap();
+    assert_eq!((first.checked, first.closed.as_slice(), first.next_after), (2, &[101][..], Some(101)));
+    assert_eq!(prs::get(&pool, 101).await.unwrap().unwrap().state, "closed");
+    let second = recover_missed_merges(&w.pulls(None), w.gh.as_ref(), first.next_after, 2).await.unwrap();
+    assert_eq!((second.checked, second.next_after), (1, None), "the walk wraps around once it reaches the end");
+    assert!(payouts::for_bounty(&pool, 4).await.unwrap().is_none(), "nothing was merged");
+    assert_eq!(w.gh.calls().iter().filter(|c| *c == "get_pull").count(), 3);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn merge_recovery_stops_at_a_rate_limit_and_resumes_there(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    fund_bounty(&w, 4, 3).await;
+    run(&w, "pull_request", &pr_event("opened", 7, 100, 900, "Closes #3", false, false, "open")).await.unwrap();
+    w.gh.set_pull(seed::REPO, 7, "abc1234", "fix", "Closes #3", false, "open", Utc::now());
+    w.gh.with(|s| s.fail_next = Some(GithubError::RateLimited { retry_at: Utc::now() + Duration::minutes(5), what: "pull".into() }));
+    let sweep = recover_missed_merges(&w.pulls(None), w.gh.as_ref(), None, 25).await.unwrap();
+    assert_eq!((sweep.checked, sweep.next_after), (0, Some(99)), "the next pass starts again at the limited PR");
+}
+
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn reviews_are_scheduled_after_a_quiet_period_for_open_non_draft_prs_only(pool: PgPool) {
     let w = world(pool.clone()).await;
@@ -550,6 +607,12 @@ async fn installing_the_app_registers_the_account_and_its_repositories(pool: PgP
     run(&w, "installation_repositories", &added).await.unwrap();
     assert_eq!(escrow_db::github::list_repos(&pool).await.unwrap().len(), 3);
 
+    let removed = json!({ "action": "removed", "installation": { "id": 77, "account": { "login": "newco", "type": "Organization" } },
+        "repositories_removed": [{ "id": 3, "full_name": "newco/c" }] });
+    run(&w, "installation_repositories", &removed).await.unwrap();
+    assert!(escrow_db::github::get_repo(&pool, 3).await.unwrap().unwrap().suspended_at.is_some());
+    assert_eq!(escrow_db::github::list_repos(&pool).await.unwrap().len(), 3);
+
     // suspend and uninstall keep the rows: bounties still point at them
     for action in ["suspend", "deleted"] {
         let ev = json!({ "action": action, "installation": { "id": 77, "account": { "login": "newco", "type": "Organization" } } });
@@ -560,6 +623,49 @@ async fn installing_the_app_registers_the_account_and_its_repositories(pool: PgP
     let back = json!({ "action": "unsuspend", "installation": { "id": 77, "account": { "login": "newco", "type": "Organization" } } });
     run(&w, "installation", &back).await.unwrap();
     assert!(escrow_db::github::get_installation(&pool, 77).await.unwrap().unwrap().suspended_at.is_none());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn renaming_or_transferring_a_repository_rewrites_its_bounties_issue_urls(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    fund_bounty(&w, 4, 3).await;
+    fund_bounty(&w, 5, 9).await;
+    let url = |id| {
+        let pool = pool.clone();
+        async move { bounties::get(&pool, id).await.unwrap().unwrap().issue_url }
+    };
+    assert_eq!(url(4).await, "https://github.com/acme/widgets/issues/3");
+
+    let renamed = json!({ "action": "renamed", "installation": { "id": seed::INSTALLATION },
+        "repository": { "id": seed::REPO_ID, "full_name": "acme/gadgets", "private": false },
+        "changes": { "repository": { "name": { "from": "widgets" } } } });
+    assert_eq!(run(&w, "repository", &renamed).await.unwrap(), "repository.renamed");
+    assert_eq!(github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap().full_name, "acme/gadgets");
+    assert_eq!(url(4).await, "https://github.com/acme/gadgets/issues/3");
+    assert_eq!(url(5).await, "https://github.com/acme/gadgets/issues/9");
+
+    // a transfer to an account where the app has another installation moves the repo under it
+    let transferred = json!({ "action": "transferred",
+        "installation": { "id": 88, "account": { "login": "newco", "type": "Organization" } },
+        "repository": { "id": seed::REPO_ID, "full_name": "newco/gadgets", "private": true } });
+    assert_eq!(run(&w, "repository", &transferred).await.unwrap(), "repository.transferred");
+    let repo = github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap();
+    assert_eq!((repo.full_name.as_str(), repo.installation_id, repo.is_private), ("newco/gadgets", 88, true));
+    assert_eq!(url(4).await, "https://github.com/newco/gadgets/issues/3");
+
+    // without an installation in the payload, a known repo is still renamed; an unknown one is not created
+    let no_inst = json!({ "action": "renamed", "repository": { "id": seed::REPO_ID, "full_name": "newco/thing" } });
+    run(&w, "repository", &no_inst).await.unwrap();
+    assert_eq!(url(5).await, "https://github.com/newco/thing/issues/9");
+    let unknown = json!({ "action": "renamed", "repository": { "id": 999, "full_name": "x/y" } });
+    run(&w, "repository", &unknown).await.unwrap();
+    assert!(github::get_repo(&pool, 999).await.unwrap().is_none());
+
+    // other actions are ignored; a sync that sees the same name changes nothing
+    let archived = json!({ "action": "archived", "repository": { "id": seed::REPO_ID, "full_name": "someone/else" } });
+    assert_eq!(run(&w, "repository", &archived).await.unwrap(), "ignored");
+    assert_eq!(github::get_repo(&pool, seed::REPO_ID).await.unwrap().unwrap().full_name, "newco/thing");
+    assert_eq!(github::rename_repo(&pool, seed::REPO_ID, "newco/thing").await.unwrap(), 0);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

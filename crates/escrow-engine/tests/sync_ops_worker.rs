@@ -181,10 +181,10 @@ async fn refund_reminders_go_out_once_each_at_the_right_time(pool: PgPool) {
 
     assert!(send(Utc::now()).await.unwrap().is_empty(), "weeks before the window: silent");
     let soon = deadline + grace - Duration::hours(47);
-    assert_eq!(send(soon).await.unwrap(), ["soon:4"]);
+    assert_eq!(send(soon).await.unwrap().sent, ["soon:4"]);
     assert!(send(soon + Duration::minutes(5)).await.unwrap().is_empty(), "not twice");
     let open = deadline + grace + Duration::minutes(1);
-    assert_eq!(send(open).await.unwrap(), ["open:4"]);
+    assert_eq!(send(open).await.unwrap().sent, ["open:4"]);
     assert!(send(open + Duration::hours(5)).await.unwrap().is_empty());
     let b = w.gh.bodies();
     assert!(b[0].contains("opens in under 48 hours") && b[1].contains("is now open"));
@@ -210,9 +210,35 @@ async fn a_reminder_whose_comment_failed_is_retried_not_forgotten(pool: PgPool) 
     let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
     let c = FlakyCommenter(Mutex::new(0));
     let at = deadline + Duration::hours(72) + Duration::minutes(1);
-    assert!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.is_err());
+    let first = send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap();
+    assert!(first.sent.is_empty());
+    assert_eq!(first.failed, ["open:4"], "a failed comment is reported, not raised");
     assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap(), "only marked sent after the comment succeeded");
-    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap(), ["open:4"]);
+    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap().sent, ["open:4"]);
+}
+
+/// Fails for one bounty, as when its repository's installation was revoked.
+struct FailsFor(i64);
+#[async_trait]
+impl IssueCommenter for FailsFor {
+    async fn comment(&self, bounty_id: i64, _body: &str) -> Result<(), escrow_engine::EngineError> {
+        if bounty_id == self.0 { Err(GithubError::Status { status: 404, what: "installation revoked".into() }.into()) } else { Ok(()) }
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn one_failing_reminder_does_not_stop_the_other_bounties(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    open_bounty(&w, 5, 6).await;
+    let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
+    let at = deadline + Duration::hours(72) + Duration::minutes(1);
+
+    let report = send_refund_reminders(&w.db, &FailsFor(4), Duration::hours(72), "w", at).await.unwrap();
+    assert_eq!(report.sent, ["open:5"]);
+    assert_eq!(report.failed, ["open:4"]);
+    assert!(audit::exists(&pool, "reminder.refund_open", "bounty:5").await.unwrap());
+    assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap());
 }
 
 // ---------------- installations backfill ----------------

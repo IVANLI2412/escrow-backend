@@ -3,7 +3,7 @@
 
 use crate::{
     error::ChainError,
-    types::{ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
+    types::{BuiltTx, ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
 };
 use async_trait::async_trait;
 
@@ -25,11 +25,11 @@ pub trait EventSource: Send + Sync {
 /// Keys other than the relayer's never touch the server.
 #[async_trait]
 pub trait TxBuilder: Send + Sync {
-    async fn build_fund(&self, p: &FundParams) -> Result<String, ChainError>;
-    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<String, ChainError>;
-    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<String, ChainError>;
-    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<String, ChainError>;
-    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<String, ChainError>;
+    async fn build_fund(&self, p: &FundParams) -> Result<BuiltTx, ChainError>;
+    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<BuiltTx, ChainError>;
+    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<BuiltTx, ChainError>;
+    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<BuiltTx, ChainError>;
+    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<BuiltTx, ChainError>;
     /// Accepts only a signed, single-operation call to *our* contract. Returns the transaction hash.
     async fn submit_signed(&self, xdr: &str, expected_source: Option<&str>) -> Result<String, ChainError>;
 }

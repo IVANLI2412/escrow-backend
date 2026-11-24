@@ -35,6 +35,8 @@ pub struct Pull {
     pub state: String,
     #[serde(default)]
     pub merged: bool,
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
     pub head: Head,
     pub user: PullUser,
     pub created_at: DateTime<Utc>,

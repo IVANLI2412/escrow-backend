@@ -2,6 +2,7 @@
 //! (needs DATABASE_URL pointing at a server where the role may CREATE DATABASE).
 
 use chrono::{Duration, Utc};
+use escrow_core::PayoutStatus;
 use escrow_db::{Db, MIGRATOR, audit, bounties, disputes, github, intents, jobs, payouts, prs, reviews, sessions, users, webhooks};
 use sqlx::PgPool;
 
@@ -287,14 +288,14 @@ async fn payout_transitions_are_guarded(pool: PgPool) {
     let mut tasks = vec![];
     for _ in 0..8 {
         let (pool, id) = (pool.clone(), p.id.clone());
-        tasks.push(tokio::spawn(async move { payouts::release_from_pending(&pool, &id, "QUEUED", "GWIN").await.unwrap() }));
+        tasks.push(tokio::spawn(async move { payouts::release_from_pending(&pool, &id, PayoutStatus::Queued, "GWIN").await.unwrap() }));
     }
     let mut wins = 0;
     for t in tasks {
         wins += usize::from(t.await.unwrap());
     }
     assert_eq!(wins, 1, "exactly one caller moves it out of PENDING_WALLET");
-    assert!(!payouts::release_from_pending(&pool, &p.id, "AWAITING_MAINTAINER", "GOTHER").await.unwrap());
+    assert!(!payouts::release_from_pending(&pool, &p.id, PayoutStatus::AwaitingMaintainer, "GOTHER").await.unwrap());
 
     payouts::mark_submitted(&pool, &p.id, "hash1").await.unwrap();
     let s = payouts::get(&pool, &p.id).await.unwrap().unwrap();
@@ -330,12 +331,12 @@ async fn earnings_join_the_bounty_facts(pool: PgPool) {
     bounty(&pool, 4, 3, 50_000_000, 14).await;
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
     payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
-    let all = payouts::earnings(&pool, 900, false).await.unwrap();
+    let all = payouts::earnings(&pool, 900, false, None, 20).await.unwrap();
     let j = serde_json::to_value(&all[0]).unwrap();
     assert_eq!(j["bounty"]["amount"], "50000000");
     assert_eq!(j["bounty"]["feeBps"], 300);
     assert_eq!(j["status"], "CONFIRMED");
-    assert_eq!(payouts::earnings(&pool, 901, false).await.unwrap().len(), 0);
+    assert_eq!(payouts::earnings(&pool, 901, false, None, 20).await.unwrap().len(), 0);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
