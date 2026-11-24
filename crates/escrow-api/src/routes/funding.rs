@@ -62,7 +62,7 @@ pub async fn build_fund(
     ApiJson(b): ApiJson<BuildBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     if !keys::is_valid_account(&b.address) {
         return Err(ApiError::bad_request("a valid address and relayerAllowed are required"));
     }
@@ -105,8 +105,8 @@ pub async fn submit(
     headers: HeaderMap,
     ApiJson(b): ApiJson<SubmitBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    let a = require_user(&s, &headers, true).await?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     if b.xdr.len() < 10 || b.xdr.len() > 20_000 {
         return Err(ApiError::bad_request("xdr required"));
     }
@@ -127,7 +127,7 @@ pub async fn submit(
 
 async fn maintainer_bounty(s: &AppState, headers: &HeaderMap, ip: &ClientIp, id: &str) -> ApiResult<escrow_db::Bounty> {
     let a = require_user(s, headers, true).await?;
-    mutation_limit(s, headers, ip, 20)?;
+    mutation_limit(s, Some(&a), ip, 20)?;
     if id.is_empty() || id.len() > 18 || !id.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ApiError::not_found("bounty"));
     }
