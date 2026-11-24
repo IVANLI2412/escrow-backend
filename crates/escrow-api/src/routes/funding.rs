@@ -4,7 +4,7 @@
 use crate::{
     error::{ApiError, ApiResult},
     extract::{ApiJson, ClientIp},
-    routes::auth::mutation_limit,
+    routes::{auth::mutation_limit, prepared_tx},
     session::require_user,
     state::AppState,
 };
@@ -62,7 +62,7 @@ pub async fn build_fund(
     ApiJson(b): ApiJson<BuildBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     if !keys::is_valid_account(&b.address) {
         return Err(ApiError::bad_request("a valid address and relayerAllowed are required"));
     }
@@ -77,7 +77,7 @@ pub async fn build_fund(
         return Err(ApiError::forbidden("not_requester", "this link belongs to another GitHub user"));
     }
     let deadline = u64::try_from(now.timestamp() + i64::from(i.duration_days) * 86_400 + 60).unwrap_or(0);
-    let xdr = s
+    let built = s
         .txb
         .build_fund(&FundParams {
             maintainer: b.address,
@@ -89,7 +89,7 @@ pub async fn build_fund(
             relayer_allowed: b.relayer_allowed,
         })
         .await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -105,8 +105,8 @@ pub async fn submit(
     headers: HeaderMap,
     ApiJson(b): ApiJson<SubmitBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    let a = require_user(&s, &headers, true).await?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     if b.xdr.len() < 10 || b.xdr.len() > 20_000 {
         return Err(ApiError::bad_request("xdr required"));
     }
@@ -127,7 +127,7 @@ pub async fn submit(
 
 async fn maintainer_bounty(s: &AppState, headers: &HeaderMap, ip: &ClientIp, id: &str) -> ApiResult<escrow_db::Bounty> {
     let a = require_user(s, headers, true).await?;
-    mutation_limit(s, headers, ip, 20)?;
+    mutation_limit(s, Some(&a), ip, 20)?;
     if id.is_empty() || id.len() > 18 || !id.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ApiError::not_found("bounty"));
     }
@@ -163,8 +163,8 @@ pub async fn build_release(
     let winner =
         p.winner_address.clone().ok_or_else(|| ApiError::conflict("nothing_to_release", "no payout is waiting for your signature"))?;
     require_open_on_chain(&s, b.id).await?;
-    let xdr = s.txb.build_release(&b.maintainer, u64::try_from(b.id).unwrap_or(0), &winner).await?;
-    Ok(Json(json!({ "xdr": xdr, "winner": winner })))
+    let built = s.txb.build_release(&b.maintainer, u64::try_from(b.id).unwrap_or(0), &winner).await?;
+    Ok(Json(prepared_tx(built, Some(&winner))?))
 }
 
 pub async fn build_refund(
@@ -176,6 +176,6 @@ pub async fn build_refund(
     let b = maintainer_bounty(&s, &headers, &ip, &id).await?;
     require_open_on_chain(&s, b.id).await?;
     // the contract enforces deadline + grace itself
-    let xdr = s.txb.build_refund(&b.maintainer, u64::try_from(b.id).unwrap_or(0)).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    let built = s.txb.build_refund(&b.maintainer, u64::try_from(b.id).unwrap_or(0)).await?;
+    Ok(Json(prepared_tx(built, None)?))
 }

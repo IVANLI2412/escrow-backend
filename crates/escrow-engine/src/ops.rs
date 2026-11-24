@@ -142,7 +142,8 @@ impl AlertSender {
     /// Returns the texts actually sent (alerts whose key is not in cooldown).
     pub async fn send(&self, alerts: &[Alert], now: Instant) -> Vec<String> {
         let fresh: Vec<String> = {
-            let mut sent = self.sent.lock().unwrap();
+            // recover a poisoned lock: the map only holds cooldown timestamps, so its contents stay usable
+            let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
             // a key past its cooldown holds nothing back, so dropping it keeps the map as small as the live alerts
             sent.retain(|_, t| now.duration_since(*t) < self.cooldown);
             alerts
@@ -178,5 +179,19 @@ mod tests {
         s.send(&[Alert::new("a", "x"), Alert::new("b", "y")], t0).await;
         s.send(&[Alert::new("c", "z")], t0 + std::time::Duration::from_secs(61)).await;
         assert_eq!(s.sent.lock().unwrap().len(), 1, "only the live key is kept");
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_lock_does_not_panic_later_alerts() {
+        let s = std::sync::Arc::new(AlertSender::new(None, std::time::Duration::from_secs(60)));
+        let s2 = s.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = s2.sent.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(s.sent.is_poisoned());
+        let sent = s.send(&[Alert::new("a", "x")], Instant::now()).await;
+        assert_eq!(sent, vec!["x".to_string()]);
     }
 }

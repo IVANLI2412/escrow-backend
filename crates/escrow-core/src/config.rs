@@ -92,6 +92,8 @@ pub struct Config {
     pub review_debounce_secs: u64,
     /// believe `X-Forwarded-For` (only when behind a reverse proxy you control)
     pub trust_proxy: bool,
+    /// number of trusted proxy hops to skip from the right of `X-Forwarded-For` (default 1)
+    pub trust_proxy_hops: usize,
     /// when set, `/metrics` requires `Authorization: Bearer <token>`
     pub metrics_token: Option<String>,
     pub indexer_start_ledger: Option<u32>,
@@ -383,6 +385,11 @@ impl Config {
             r.errors.push(format!("LOG_LEVEL: '{}' is not a valid log level (use error, warn, info, debug, trace, or module=level)", log_level));
         }
 
+        let metrics_token = r.optional("METRICS_TOKEN");
+        if network == Network::Mainnet && metrics_token.is_none() {
+            r.errors.push("METRICS_TOKEN: required on mainnet (/metrics would be public)".into());
+        }
+
         let cfg = Config {
             log_level,
             port: r.number("PORT", 3001u16),
@@ -423,7 +430,14 @@ impl Config {
             indexer_lookback_ledgers: r.number("INDEXER_LOOKBACK_LEDGERS", 1000u32),
             review_debounce_secs: r.number("REVIEW_DEBOUNCE_SECS", 300u64),
             trust_proxy: matches!(r.raw("TRUST_PROXY"), Some("1" | "true")),
-            metrics_token: r.optional("METRICS_TOKEN"),
+            trust_proxy_hops: {
+                let hops = r.number("TRUST_PROXY_HOPS", 1usize);
+                if hops == 0 {
+                    r.errors.push("TRUST_PROXY_HOPS: must be at least 1".into());
+                }
+                hops
+            },
+            metrics_token,
             indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
             db_max_connections: r.number("DB_MAX_CONNECTIONS", 10u32),
             worker_concurrency: r.number("WORKER_CONCURRENCY", 4usize),
@@ -523,11 +537,18 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_makes_you_choose_an_rpc_provider() {
+    fn mainnet_makes_you_choose_an_rpc_provider_and_protect_metrics() {
         let e = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet")])).unwrap_err().to_string();
         assert!(e.contains("STELLAR_RPC_URL: required"), "{e}");
-        let c = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet"), ("STELLAR_RPC_URL", "https://rpc.example/")])).unwrap();
+        assert!(e.contains("METRICS_TOKEN: required"), "{e}");
+        let c = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("METRICS_TOKEN", "metrics-secret"),
+        ]))
+        .unwrap();
         assert_eq!(c.rpc_url, "https://rpc.example");
+        assert_eq!(c.metrics_token.as_deref(), Some("metrics-secret"));
         assert_eq!(c.network_passphrase, "Public Global Stellar Network ; September 2015");
         assert!(c.explorer_tx_template.contains("/explorer/public/"));
     }
@@ -536,8 +557,21 @@ mod tests {
     fn relayer_secret_is_refused_on_mainnet() {
         let sk = format!("S{}", "A".repeat(55));
         assert!(Config::from_map(&with(&[("RELAYER_SECRET", &sk)])).is_ok());
-        let e = Config::from_map(&with(&[("RELAYER_SECRET", &sk), ("STELLAR_NETWORK", "mainnet")])).unwrap_err().to_string();
+        let e = Config::from_map(&with(&[("RELAYER_SECRET", &sk), ("STELLAR_NETWORK", "mainnet"), ("METRICS_TOKEN", "metrics-secret")]))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("must not be used on mainnet"));
+    }
+
+    #[test]
+    fn metrics_token_is_optional_off_mainnet() {
+        let c = Config::from_map(&base()).unwrap();
+        assert_eq!(c.metrics_token, None);
+        assert!(Config::from_map(&with(&[("METRICS_TOKEN", "metrics-secret")])).unwrap().metrics_token.is_some());
+        let e = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet"), ("STELLAR_RPC_URL", "https://rpc.example/")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("METRICS_TOKEN"), "{e}");
     }
 
     #[test]

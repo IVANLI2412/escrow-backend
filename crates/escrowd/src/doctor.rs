@@ -93,10 +93,23 @@ impl Report {
     }
 }
 
+fn check_metrics(r: &mut Report, token: Option<&str>) {
+    match token {
+        Some(_) => r.ok("metrics", "METRICS_TOKEN set: /metrics requires a bearer token"),
+        None => r.add(
+            Status::Warn,
+            "metrics",
+            "METRICS_TOKEN unset: /metrics is public and exposes bounty, payout and job counts",
+            Some("Set METRICS_TOKEN to require Authorization: Bearer <token> on /metrics."),
+        ),
+    }
+}
+
 pub async fn run(cfg: Config, as_json: bool) -> Result<()> {
     let mut r = Report::new();
     r.ok("configuration", format!("valid ({:?}, contract {}…)", cfg.network, &cfg.contract_id[..8]));
     r.ok("log level", format!("{}", cfg.log_level));
+    check_metrics(&mut r, cfg.metrics_token.as_deref());
 
     match runtime::connect(cfg.clone(), false).await {
         Err(e) => r.add(Status::Fail, "database", format!("{e:#}"), Some("Check DATABASE_URL and that Postgres is running.")),
@@ -326,5 +339,19 @@ mod tests {
         );
         assert_eq!(arr[2], json!({ "name": "database", "status": "fail", "detail": "connection refused", "fix": "Check DATABASE_URL." }));
         assert_eq!(r.failed_count(), 1);
+    }
+
+    #[test]
+    fn public_metrics_are_warned_about() {
+        let mut public = Report::new();
+        check_metrics(&mut public, None);
+        let row = &public.checks[0];
+        assert_eq!((row.status, row.name.as_str()), (Status::Warn, "metrics"));
+        assert!(row.detail.contains("/metrics is public"));
+        assert_eq!(public.failed_count(), 0);
+
+        let mut private = Report::new();
+        check_metrics(&mut private, Some("secret"));
+        assert_eq!((private.checks[0].status, private.checks[0].name.as_str()), (Status::Ok, "metrics"));
     }
 }
