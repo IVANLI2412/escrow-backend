@@ -29,7 +29,7 @@ curl 'localhost:3001/bounties?sort=highest&limit=2'
 }
 ```
 
-Filters: `status` (default `OPEN`), `token`, `minAmount`, `q` (title or repository, case-insensitive, wildcards are literal), `sort` (`newest` | `highest` | `ending`), `limit` (1–50), `cursor` (the previous `nextCursor`). Pagination is stable under ties. `GET /bounties/{id}` adds the pull requests (each with its latest AI review) and the payouts. `GET /config` returns the fee, grace and durations read live from the contract plus the arbiter's address; `GET /stats` returns headline numbers; `GET /users/{login}` is a contributor's public record (confirmed payouts only, each verifiable on chain by its `txHash`).
+Filters: `status` (default `OPEN`), `token`, `minAmount`, `q` (title or repository, case-insensitive, wildcards are literal), `sort` (`newest` | `highest` | `ending`), `limit` (1–50), `cursor` (the previous `nextCursor`). Pagination is stable under ties. `GET /bounties/{id}` adds the pull requests (each with its latest AI review) and the payouts. `GET /config` returns the fee, grace and durations read live from the contract plus the arbiter's address; `GET /stats` returns headline numbers; `GET /users/{login}` is a contributor's public record (confirmed payouts only, each verifiable on chain by its `txHash`). Its `paid` list and `GET /me/earnings` (`{ items, nextCursor }`) page the same way: newest first, `limit` (1–50, default 20) and `cursor` (the previous `nextCursor`).
 
 ## Signing in
 

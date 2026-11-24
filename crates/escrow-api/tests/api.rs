@@ -348,6 +348,55 @@ async fn public_profiles_show_only_confirmed_payouts(pool: PgPool) {
     assert_eq!(get(&e, "/users/a%2Fb").await.status, StatusCode::NOT_FOUND);
 }
 
+async fn my_earnings_page(e: &Env, s: &Session, q: String) -> Resp {
+    call(&e.app, Method::GET, &format!("/me/earnings{q}"), &s.hdrs(false), None).await
+}
+
+// #139: both earnings lists page by `limit` and a keyset `cursor`, like `/bounties`.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn earnings_lists_are_paginated(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    for (id, issue) in [(5, 4), (6, 5)] {
+        fund_more(&e, id, issue).await;
+    }
+    users::upsert_github(&pool, 900, "dev", None, false).await.unwrap();
+    let mut ids = vec![];
+    for (bounty, pr) in [(4, 7), (5, 8), (6, 9)] {
+        let p = payouts::create_pending(&pool, bounty, pr, 900).await.unwrap().unwrap();
+        payouts::mark_confirmed(&pool, &p.id, Some(&format!("tx{pr}"))).await.unwrap();
+        ids.push(p.id);
+    }
+    let contributor = signed_in(&e, 900, "dev", Some("GCONTRIB"), false).await;
+    let me = |q: &str| my_earnings_page(&e, &contributor, q.to_string());
+
+    // newest first, two per page, then the rest
+    let p1 = me("?limit=2").await;
+    assert_eq!(p1.status, StatusCode::OK);
+    let got: Vec<&str> = p1.body["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(got, vec![ids[2].as_str(), ids[1].as_str()]);
+    assert_eq!(p1.body["nextCursor"].as_str(), Some(ids[1].as_str()));
+    let p2 = me(&format!("?limit=2&cursor={}", ids[1])).await;
+    assert_eq!(p2.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(p2.body["items"][0]["id"].as_str(), Some(ids[0].as_str()));
+    assert_eq!(p2.body["nextCursor"], Value::Null);
+    // the default page holds all three
+    assert_eq!(me("").await.body["items"].as_array().unwrap().len(), 3);
+    for bad in ["?limit=0", "?limit=51", "?limit=x", "?cursor=NOT-AN-ID", "?cursor=short"] {
+        assert_eq!(me(bad).await.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // the public profile pages its paid list the same way
+    let u1 = get(&e, "/users/dev?limit=2").await;
+    assert_eq!(u1.body["paid"].as_array().unwrap().len(), 2);
+    assert_eq!(u1.body["paid"][0]["txHash"].as_str(), Some("tx9"));
+    let cursor = u1.body["nextCursor"].as_str().unwrap().to_string();
+    let u2 = get(&e, &format!("/users/dev?limit=2&cursor={cursor}")).await;
+    assert_eq!((u2.body["paid"].as_array().unwrap().len(), u2.body["paid"][0]["txHash"].as_str()), (1, Some("tx7")));
+    assert_eq!(u2.body["nextCursor"], Value::Null);
+    assert_eq!(get(&e, "/users/dev?limit=100").await.status, StatusCode::BAD_REQUEST);
+}
+
 async fn fund_more(e: &Env, id: i64, issue: i32) {
     seed::bounty(&e.db, &seed::B::new(id, issue)).await;
     e.chain.put(id as u64, seed::MAINTAINER_WALLET, BountyStatus::Open, true, None);
@@ -696,10 +745,12 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
     payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
     let r = call(&e.app, Method::GET, "/me/earnings", &contributor.hdrs(false), None).await;
+    let first = &r.body["items"][0];
     assert_eq!(
-        (r.body[0]["status"].as_str(), r.body[0]["bounty"]["amount"].as_str(), r.body[0]["bounty"]["feeBps"].as_i64()),
+        (first["status"].as_str(), first["bounty"]["amount"].as_str(), first["bounty"]["feeBps"].as_i64()),
         (Some("CONFIRMED"), Some("50000000"), Some(300))
     );
+    assert_eq!(r.body["nextCursor"], Value::Null);
 
     let maintainer = signed_in(&e, 500, "maint", Some(seed::MAINTAINER_WALLET), false).await;
     let funded = call(&e.app, Method::GET, "/me/funded", &maintainer.hdrs(false), None).await;
@@ -707,6 +758,33 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     let no_wallet = signed_in(&e, 501, "nowallet", None, false).await;
     assert_eq!(call(&e.app, Method::GET, "/me/funded", &no_wallet.hdrs(false), None).await.body, json!([]));
     assert_eq!(get(&e, "/me/earnings").await.status, StatusCode::UNAUTHORIZED);
+}
+
+// #138: /me/funded keeps bounties funded from an earlier wallet, by the maintainer's GitHub account.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn my_funded_covers_the_current_wallet_an_old_wallet_and_no_wallet(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await; // current wallet, recorded against github 500
+    fund_more(&e, 5, 4).await;
+    fund_more(&e, 6, 5).await;
+    fund_more(&e, 7, 6).await;
+    // 5: funded from an earlier wallet of the same account; 6: current wallet, account not yet known; 7: someone else
+    sqlx::query("UPDATE bounties SET maintainer = 'GOLDWALLET' WHERE id = 5").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE bounties SET maintainer_github_id = NULL WHERE id = 6").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE bounties SET maintainer = 'GSOMEONEELSE', maintainer_github_id = 777 WHERE id = 7").execute(&pool).await.unwrap();
+    let ids = |r: &Resp| r.body.as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    let m = signed_in(&e, 500, "maint", Some(seed::MAINTAINER_WALLET), false).await;
+    let r = call(&e.app, Method::GET, "/me/funded", &m.hdrs(false), None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(ids(&r), vec!["6", "5", "4"], "current wallet and old wallet, each once, newest first");
+
+    // after unlinking, the account still sees what is recorded against it
+    sqlx::query("UPDATE users SET wallet = NULL WHERE github_id = 500").execute(&pool).await.unwrap();
+    assert_eq!(ids(&call(&e.app, Method::GET, "/me/funded", &m.hdrs(false), None).await), vec!["5", "4"]);
+
+    let stranger = signed_in(&e, 501, "nowallet", None, false).await;
+    assert_eq!(call(&e.app, Method::GET, "/me/funded", &stranger.hdrs(false), None).await.body, json!([]));
 }
 
 // ================= funding =================
