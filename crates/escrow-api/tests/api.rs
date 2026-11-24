@@ -11,7 +11,7 @@ use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer as _, SigningKey};
 use escrow_api::{AppState, limiter::RateLimiter, login::GithubLogin, metrics::Metrics, router, state::ApiConfig};
 use escrow_core::{
-    BountyStatus,
+    BountyStatus, PayoutStatus,
     oauth::{OAUTH_COOKIE, SESSION_COOKIE, clear_cookie},
     security::{csrf_token, hash_session_id, hmac_hex, sep53_hash},
 };
@@ -998,6 +998,17 @@ async fn submitting_a_signed_transaction_is_relayed_and_failures_are_explained(p
         (bad.status, bad.body["error"]["code"].clone(), bad.body["error"]["message"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, json!("submit_rejected"), Some("this is not a call to the SkillEscrow contract"))
     );
+    for (raw, name, fragment) in [
+        ("HostError: Error(Contract, #9)", "IssueAlreadyFunded", "already has a bounty"),
+        ("HostError: Error(Contract, #12)", "DeadlineNotReached", "grace period"),
+    ] {
+        *e.txb.fail_with.lock().unwrap() = Some(escrow_chain::ChainError::Simulation(raw.into()));
+        let r = call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "AAAA-signed-envelope" }))).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.body["error"]["code"], json!("contract_error"));
+        assert_eq!(r.body["error"]["contractError"], json!(name));
+        assert!(r.body["error"]["message"].as_str().unwrap().contains(fragment), "{}", r.body);
+    }
     assert_eq!(call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "x" }))).await.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "y".repeat(20_001) }))).await.status,
@@ -1045,7 +1056,7 @@ async fn a_release_is_built_only_for_a_payout_waiting_on_the_maintainer(pool: Pg
     assert_eq!((none.status, none.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("nothing_to_release")));
 
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
-    payouts::release_from_pending(&pool, &p.id, "AWAITING_MAINTAINER", "GWINNER").await.unwrap();
+    payouts::release_from_pending(&pool, &p.id, PayoutStatus::AwaitingMaintainer, "GWINNER").await.unwrap();
     let ok = call(&e.app, Method::POST, "/bounties/4/release/build", &maintainer.hdrs(true), None).await;
     assert_eq!(
         (ok.status, ok.body["winner"].as_str(), ok.body["xdr"].as_str()),
