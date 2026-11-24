@@ -110,6 +110,10 @@ pub async fn refresh_bounty_card(d: &SyncDeps, bounty_id: i64) -> Result<CardOut
 
     if b.status().is_active() {
         d.gh.set_bounty_label(inst, name, b.issue_number, &label_for(b.amount_i128(), &symbol)).await?;
+    } else {
+        // Terminal state: clear the amount label so label-based searches stop offering this issue as a
+        // bounty. Removing it beats adding `bounty: paid`: no `bounty:` label remains either way.
+        d.gh.remove_bounty_labels(inst, name, b.issue_number).await?;
     }
     Ok(outcome)
 }

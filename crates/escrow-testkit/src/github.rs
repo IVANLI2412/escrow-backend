@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use escrow_core::card::is_bounty_label;
 use escrow_github::{CiConclusion, GithubApi, GithubError, InstallationInfo, Issue, Pull, PullFile, RepoInfo};
 use std::{collections::HashMap, sync::Mutex};
 
@@ -158,7 +159,16 @@ impl GithubApi for FakeGithub {
 
     async fn set_bounty_label(&self, _i: i64, repo: &str, issue: i32, label: &str) -> Result<(), GithubError> {
         self.enter("set_bounty_label").await?;
-        self.with(|s| s.labels.push((repo.into(), issue, label.into())));
+        self.with(|s| {
+            s.labels.retain(|(r, n, l)| r != repo || *n != issue || !is_bounty_label(l));
+            s.labels.push((repo.into(), issue, label.into()));
+        });
+        Ok(())
+    }
+
+    async fn remove_bounty_labels(&self, _i: i64, repo: &str, issue: i32) -> Result<(), GithubError> {
+        self.enter("remove_bounty_labels").await?;
+        self.with(|s| s.labels.retain(|(r, n, l)| r != repo || *n != issue || !is_bounty_label(l)));
         Ok(())
     }
 

@@ -76,7 +76,19 @@ async fn the_card_reflects_the_new_status_and_drops_the_label_when_the_bounty_cl
     refresh_bounty_card(&w.sync(), 4).await.unwrap();
     let edited = w.gh.with(|s| s.edits.last().cloned()).unwrap().1;
     assert!(edited.contains("✅ Paid") && !edited.contains("How to claim"));
-    assert_eq!(w.gh.with(|s| s.labels.len()), 1, "no new label for a closed bounty");
+    assert!(w.gh.with(|s| s.labels.is_empty()), "a closed bounty keeps no bounty: label");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_refunded_bounty_has_its_bounty_label_removed(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    refresh_bounty_card(&w.sync(), 4).await.unwrap();
+    assert_eq!(w.gh.with(|s| s.labels.clone()), [(seed::REPO.to_string(), 3, "bounty: 5 XLM".to_string())]);
+    bounties::apply_refunded(&pool, 4, "e", "t").await.unwrap();
+    refresh_bounty_card(&w.sync(), 4).await.unwrap();
+    assert!(w.gh.with(|s| s.labels.is_empty()), "a refunded bounty must not be searchable as available");
+    assert!(w.gh.calls().iter().any(|c| c == "remove_bounty_labels"));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

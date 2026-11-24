@@ -74,9 +74,18 @@ pub fn render_card(c: &CardInput<'_>) -> String {
     lines.join("\n")
 }
 
+/// Prefix of every label this bot manages on a bounty issue.
+pub const BOUNTY_LABEL_PREFIX: &str = "bounty:";
+
+/// True for any bot-managed bounty label. Used both to replace the amount label and to clear all such
+/// labels when the bounty reaches a terminal state.
+pub fn is_bounty_label(label: &str) -> bool {
+    label.starts_with(BOUNTY_LABEL_PREFIX)
+}
+
 /// The issue label, e.g. `bounty: 50 USDC`.
 pub fn label_for(amount: i128, symbol: &str) -> String {
-    format!("bounty: {} {}", display(amount, 0), symbol)
+    format!("{} {} {}", BOUNTY_LABEL_PREFIX, display(amount, 0), symbol)
 }
 
 #[cfg(test)]
@@ -181,5 +190,14 @@ mod tests {
     fn label_matches_the_convention() {
         assert_eq!(label_for(500_000_000, "USDC"), "bounty: 50 USDC");
         assert_eq!(label_for(55_000_000, "XLM"), "bounty: 5.5 XLM");
+    }
+
+    #[test]
+    fn bounty_labels_are_recognised_without_matching_unrelated_ones() {
+        assert!(is_bounty_label(&label_for(500_000_000, "USDC")));
+        assert!(is_bounty_label("bounty: paid"));
+        assert!(!is_bounty_label("bug"));
+        assert!(!is_bounty_label("help wanted"));
+        assert!(!is_bounty_label("not-bounty: 5 XLM"));
     }
 }
