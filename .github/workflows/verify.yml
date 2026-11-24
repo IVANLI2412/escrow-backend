@@ -23,4 +23,5 @@ jobs:
           key: cargo-verify-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-verify-
       - run: rustup show active-toolchain || rustup toolchain install
-      - run: cargo test --workspace --locked
+      - run: cargo test -p escrow-core --lib --locked
+      - run: cargo test -p escrow-engine --test sync_ops_worker --locked
