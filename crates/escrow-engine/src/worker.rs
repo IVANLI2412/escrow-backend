@@ -181,7 +181,12 @@ pub async fn run_periodic(w: Arc<WorkerDeps>, stop: CancellationToken) {
                 }
             }
             _ = alerts.tick() => {
-                let balance = match &w.relayer { Some(r) => r.balance_xlm().await.ok(), None => None };
+                // #108: the failed-read case is its own alert, so pass the Result through rather
+                // than silently collapsing the error to None.
+                let balance = match &w.relayer {
+                    Some(r) => Some(r.balance_xlm().await.map_err(|e| e.to_string())),
+                    None => None,
+                };
                 let tip = w.chain.latest_ledger().await.ok();
                 match collect_alerts(&w.db, &AlertInputs { relayer_balance_xlm: balance, min_relayer_xlm: w.min_relayer_xlm, latest_ledger: tip, now: Utc::now() }).await {
                     Ok(msgs) => { w.alerts.send(&msgs, std::time::Instant::now()).await; }

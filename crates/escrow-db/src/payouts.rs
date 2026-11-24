@@ -5,7 +5,7 @@ use crate::{is_unique_violation, models::Payout, new_id};
 use serde::Serialize;
 use sqlx::{PgExecutor, Postgres, QueryBuilder};
 
-const COLS: &str = "id, bounty_id, pr_number, winner_github_id, winner_address, status, idempotency_key, tx_hash, attempts, last_error, created_at, updated_at";
+const COLS: &str = "id, bounty_id, pr_number, winner_github_id, winner_address, status, idempotency_key, tx_hash, attempts, last_error, created_at, updated_at, failure_notified_at";
 
 pub fn idempotency_key(bounty_id: i64) -> String {
     format!("release:{bounty_id}")
@@ -93,6 +93,21 @@ pub async fn mark_submitted<'e>(ex: impl PgExecutor<'e>, id: &str, tx_hash: &str
         .execute(ex)
         .await
         .map(|_| ())
+}
+
+/// #107: claims the one "payout needs attention" PR comment for this payout. Returns `true` the
+/// first time it is called against a FAILED row; subsequent calls (another pass through
+/// `relay_release`, another `advance`) return `false` and the caller must not comment again.
+///
+/// Guarded on `failure_notified_at IS NULL` so that concurrent callers resolve to exactly one
+/// writer. The row's status check keeps the column from being set on a payout that is still
+/// moving (QUEUED / SUBMITTED) and would later succeed.
+pub async fn claim_failure_notice<'e>(ex: impl PgExecutor<'e>, id: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query("UPDATE payouts SET failure_notified_at = now() WHERE id = $1 AND status = 'FAILED' AND failure_notified_at IS NULL")
+        .bind(id)
+        .execute(ex)
+        .await
+        .map(|r| r.rows_affected() == 1)
 }
 
 pub async fn record_attempt_error<'e>(ex: impl PgExecutor<'e>, id: &str, error: &str) -> Result<(), sqlx::Error> {
@@ -237,7 +252,7 @@ pub async fn earnings<'e>(
 ) -> Result<Vec<Earning>, sqlx::Error> {
     let mut rows: Vec<Earning> = sqlx::query_as(
         "SELECT p.id, p.bounty_id, p.pr_number, p.winner_github_id, p.winner_address, p.status, p.idempotency_key, p.tx_hash, p.attempts,
-                p.last_error, p.created_at, p.updated_at,
+                p.last_error, p.created_at, p.updated_at, p.failure_notified_at,
                 b.token AS b_token, b.amount::text AS b_amount, b.fee_bps AS b_fee_bps, b.issue_title AS b_title, b.id AS b_id, b.issue_url AS b_url
          FROM payouts p JOIN bounties b ON b.id = p.bounty_id
          WHERE p.winner_github_id = $1 AND ($2 = FALSE OR p.status = 'CONFIRMED')
