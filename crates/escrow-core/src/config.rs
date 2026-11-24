@@ -857,6 +857,7 @@ mod tests {
             ("STELLAR_RPC_URL", "https://rpc.example/"),
             ("API_PUBLIC_URL", "https://api.example.com/"),
             ("WEB_PUBLIC_URL", "https://web.example.com/"),
+            ("METRICS_TOKEN", "metrics-secret"),
         ]))
         .unwrap();
         assert_eq!(c.api_public_url, "https://api.example.com");
