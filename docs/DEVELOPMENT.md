@@ -102,6 +102,16 @@ RELAYER_SECRET=S… LIVE_BOUNTY=4 LIVE_WINNER=G… cargo test -p escrow-chain --
 4. Examples of injection techniques tested: fence-closing variants (case/whitespace), zero-width characters, homoglyphs, encoding (base64/rot13), very long inputs, schema imitation, nested structures, unicode normalization. At least 40 cases must exist and pass for CI to succeed.
 5. Run `cargo test -p escrow-ai injection` to verify.
 
+## Fuzzing
+
+The event and `ScVal` decoders have `cargo-fuzz` targets under `crates/escrow-chain/fuzz`:
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run --fuzz-dir crates/escrow-chain/fuzz decode_event
+cargo +nightly fuzz run --fuzz-dir crates/escrow-chain/fuzz decode_scval
+```
+
 ## Conventions
 
 - `cargo fmt` (config in `rustfmt.toml`), clippy clean with `-D warnings`, no `unsafe`.
