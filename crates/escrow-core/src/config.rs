@@ -935,7 +935,8 @@ mod tests {
         assert_eq!(c.warnings.len(), 2);
         assert!(c.warnings.iter().any(|w| w.contains("GITHUB_WEBHOOK_SECRET")));
         assert!(c.warnings.iter().any(|w| w.contains("DB_MAX_CONNECTIONS")));
-=======
+    }
+
     #[test]
     fn admin_github_ids_above_i64_max_are_rejected() {
         let overflow = format!("{}", (i64::MAX as u128) + 1);
