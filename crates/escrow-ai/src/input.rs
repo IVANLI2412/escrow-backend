@@ -109,7 +109,7 @@ pub fn context_candidates(changed: &[FileChange]) -> Vec<String> {
 static EXCLUDED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|poetry\.lock)$|(^|/)(vendor|node_modules|dist|build|target)/|\.min\.(js|css)$|\.(png|jpe?g|gif|webp|pdf|wasm|zip)$|\.snap$").unwrap()
 });
-static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</?\s*untrusted_(pr|issue|repo)\s*>").unwrap());
+static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:<\s*/?\s*)?untrusted_(pr|issue|repo)\s*>").unwrap());
 
 pub const MAX_ISSUE_CHARS: usize = 8_000;
 pub const MAX_PR_BODY_CHARS: usize = 4_000;

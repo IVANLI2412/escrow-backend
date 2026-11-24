@@ -33,7 +33,8 @@ impl RateLimiter {
 
     /// Counts one request for `key`; `false` once it exceeds `max` within the window.
     pub fn check(&self, key: &str, max: u32, now: Instant) -> bool {
-        let mut hits = self.hits.lock().unwrap();
+        // a panic elsewhere while holding the lock must not take every later request down with it
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         if hits.len() > PRUNE_ABOVE {
             hits.retain(|_, (start, _)| now.duration_since(*start) < self.window);
         }
@@ -47,7 +48,7 @@ impl RateLimiter {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.hits.lock().unwrap().len()
+        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -100,5 +101,20 @@ mod tests {
         }
         l.check("late", 5, t + Duration::from_secs(5));
         assert!(l.len() < 100, "{}", l.len());
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_panic_later_requests() {
+        let l = std::sync::Arc::new(RateLimiter::new(Duration::from_secs(60)));
+        let l2 = l.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = l2.hits.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(l.hits.is_poisoned());
+        let t = Instant::now();
+        assert!(l.check("a", 1, t));
+        assert!(!l.check("a", 1, t));
     }
 }

@@ -29,7 +29,7 @@ curl 'localhost:3001/bounties?sort=highest&limit=2'
 }
 ```
 
-Filters: `status` (default `OPEN`), `token`, `minAmount`, `q` (title or repository, case-insensitive, wildcards are literal), `sort` (`newest` | `highest` | `ending`), `limit` (1–50), `cursor` (the previous `nextCursor`). Pagination is stable under ties. `GET /bounties/{id}` adds the pull requests (each with its latest AI review) and the payouts. `GET /config` returns the fee, grace and durations read live from the contract plus the arbiter's address; `GET /stats` returns headline numbers; `GET /users/{login}` is a contributor's public record (confirmed payouts only, each verifiable on chain by its `txHash`).
+Filters: `status` (default `OPEN`), `token`, `minAmount`, `q` (title or repository, case-insensitive, wildcards are literal), `sort` (`newest` | `highest` | `ending`), `limit` (1–50), `cursor` (the previous `nextCursor`). Pagination is stable under ties. `GET /bounties/{id}` adds the pull requests (each with its latest AI review) and the payouts. `GET /config` returns the fee, grace and durations read live from the contract plus the arbiter's address; `GET /stats` returns headline numbers; `GET /users/{login}` is a contributor's public record (confirmed payouts only, each verifiable on chain by its `txHash`). Its `paid` list and `GET /me/earnings` (`{ items, nextCursor }`) page the same way: newest first, `limit` (1–50, default 20) and `cursor` (the previous `nextCursor`).
 
 ## Signing in
 
@@ -57,7 +57,7 @@ curl -X POST localhost:3001/wallet/verify … -d '{"challengeId":"…","signatur
 # → { "address": "G…" }
 ```
 
-The signature is verified over `sha256("Stellar Signed Message:\n" + message)`. A challenge expires after 5 minutes and is single-use (burned atomically). An address already linked to another account is refused (`address_taken`). If a payout was waiting for this wallet, it continues immediately.
+The signature is verified over `sha256("Stellar Signed Message:\n" + message)`. A challenge expires after 5 minutes and is single-use (burned atomically). An address already linked to another account is refused (`address_taken`). If a payout was waiting for this wallet, it continues immediately. Linking and `DELETE /wallet` both write an audit entry with the user and old/new addresses; unlinking shares the 20-per-window mutation budget.
 
 ## Funding a bounty
 
@@ -65,21 +65,27 @@ The bot's comment links to the web app's `/fund/<id>`, which uses:
 
 ```
 GET  /intents/{id}                 { state: open|used|expired, repo, issueNumber, token, amount, durationDays, expiresAt, bountyId }
-POST /intents/{id}/build           { address, relayerAllowed }  →  { xdr }      unsigned, simulated, ready for the wallet
+POST /intents/{id}/build           { address, relayerAllowed }  →  { xdr, validUntil }   unsigned, simulated, ready for the wallet
      (wallet signs the XDR)
 POST /tx/submit                    { xdr, address? }            →  { hash }
 ```
 
-Only the GitHub user who typed `/bounty` may build through the link (`403 not_requester`). `/tx/submit` accepts **only** a signed, single-operation call to this contract's user functions; an unsigned envelope, another contract, a fee bump, a muxed source, or an admin function such as `upgrade` is refused before it reaches the network. After submission the indexer sees the `funded` event, creates the bounty, and the card appears on the issue.
+Only the GitHub user who typed `/bounty` may build through the link (`403 not_requester`). `/tx/submit` accepts **only** a signed, single-operation call to this contract's user functions; an unsigned envelope, another contract, a fee bump, a muxed source, or an admin function such as `upgrade` is refused before it reaches the network. If the contract itself rejects the call, the response is `422` with a stable code and the variant name in a separate field, so clients can branch without parsing text:
+
+```json
+{ "error": { "code": "contract_error", "contractError": "IssueAlreadyFunded", "message": "This issue already has a bounty." } }
+```
+
+`contractError` is one of the variants in `crates/escrow-core/src/contract_errors.rs`; `message` is safe to show to people. Other refusals keep `code: "submit_rejected"`. After submission the indexer sees the `funded` event, creates the bounty, and the card appears on the issue.
 
 ## Releasing and refunding as the maintainer
 
 ```
-POST /bounties/{id}/release/build   →  { xdr, winner }   only for a merged PR whose payout is AWAITING_MAINTAINER
-POST /bounties/{id}/refund/build    →  { xdr }           the contract enforces deadline + 72 h grace
+POST /bounties/{id}/release/build   →  { xdr, validUntil, winner }   only for a merged PR whose payout is AWAITING_MAINTAINER
+POST /bounties/{id}/refund/build    →  { xdr, validUntil }           the contract enforces deadline + 72 h grace
 ```
 
-Both require your linked wallet to be the bounty's maintainer, and both re-read the bounty from the chain first (`409 not_open` if it is no longer open).
+Both require your linked wallet to be the bounty's maintainer, and both re-read the bounty from the chain first (`409 not_open` if it is no longer open). Every build also returns `validUntil` (RFC 3339, from the transaction's own time bound): a wallet has about ten minutes to sign, and an expired XDR must be rebuilt rather than signed.
 
 ## Admin (the arbiter)
 
@@ -87,8 +93,8 @@ Admin rights come from `ADMIN_GITHUB_IDS` and are re-applied at every login. The
 
 ```
 GET  /admin/disputes                           open disputes, oldest first (overdue = older than 36 h)
-POST /admin/disputes/{id}/open-onchain         { arbiterAddress }                       → { xdr }   open_dispute
-POST /admin/disputes/{id}/resolve/build        { arbiterAddress, winner?, winnerBps, note? } → { xdr }   resolve (a split)
+POST /admin/disputes/{id}/open-onchain         { arbiterAddress }                       → { xdr, validUntil }   open_dispute
+POST /admin/disputes/{id}/resolve/build        { arbiterAddress, winner?, winnerBps, note? } → { xdr, validUntil }   resolve (a split)
 POST /admin/disputes/{id}/reject               { note }
 GET  /admin/payouts?status=FAILED
 POST /admin/payouts/{id}/retry                 only FAILED payouts with no submitted transaction
@@ -99,9 +105,9 @@ GET  /admin/status
 
 ## GitHub webhooks
 
-`POST /github/webhooks` with `X-Hub-Signature-256`, `X-GitHub-Delivery`, `X-GitHub-Event`. The signature is checked over the raw body before anything is parsed. A new delivery is recorded and queued (`202 { "queued": true }`); a redelivery is acknowledged without being processed again (`200 { "duplicate": true }`). Handled events: `installation`, `installation_repositories`, `issue_comment` (commands), `pull_request` (linking, review scheduling, merge → payout), `issues` (title and criteria edits). Others are acknowledged and ignored.
+`POST /github/webhooks` with `X-Hub-Signature-256`, `X-GitHub-Delivery`, `X-GitHub-Event`. The signature is checked over the raw body before anything is parsed. A new delivery is recorded and queued (`202 { "queued": true }`); a redelivery is acknowledged without being processed again (`200 { "duplicate": true }`). Handled events: `installation`, `installation_repositories`, `repository` (`renamed` and `transferred` update the stored name and every bounty's `issueUrl`), `issue_comment` (commands), `pull_request` (linking, review scheduling, merge → payout), `issues` (title and criteria edits). Others are acknowledged and ignored.
 
 ## Operations
 
 - `GET /health`: `{ ok, db, rpc, indexerLagLedgers, deadJobs }`. `503` when the database or RPC is unreachable or the indexer is more than 60 ledgers behind.
-- `GET /metrics`: Prometheus text. Counters for requests, 5xx, rate-limited requests, webhooks accepted / duplicate / rejected, sign-ins, wallets linked; gauges for bounties, payouts and jobs by status and the indexer's ledger. Set `METRICS_TOKEN` to require `Authorization: Bearer …`.
+- `GET /metrics`: Prometheus text. Counters for requests, 5xx, rate-limited requests, webhooks accepted / duplicate / rejected, sign-ins, wallets linked; gauges for bounties, payouts and jobs by status, the indexer's ledger and `skillescrow_metrics_db_up` (`1` when those queries succeeded, `0` and a warn log when the database failed). By default `METRICS_TOKEN` is unset and `/metrics` is public; set it to require `Authorization: Bearer …`. It is required on mainnet.

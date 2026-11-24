@@ -90,6 +90,15 @@ pub fn from_b64(s: &str) -> Result<TransactionEnvelope, ChainError> {
     Ok(TransactionEnvelope::from_xdr_base64(s, Limits::none())?)
 }
 
+pub fn max_time(tx: &Transaction) -> Option<u64> {
+    let bounds = match &tx.cond {
+        Preconditions::Time(b) => Some(b),
+        Preconditions::V2(v) => v.time_bounds.as_ref(),
+        Preconditions::None => None,
+    };
+    bounds.filter(|b| b.max_time.0 != 0).map(|b| b.max_time.0)
+}
+
 /// Applies a successful simulation: the Soroban resource data, the resource fee and the auth entries.
 /// The fee bid carries a 20% margin on the resource fee; unused fee is refunded by the network.
 pub fn assemble(mut tx: Transaction, sim: &SimulationOk) -> Result<Transaction, ChainError> {

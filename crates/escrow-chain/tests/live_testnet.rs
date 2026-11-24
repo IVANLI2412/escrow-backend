@@ -78,7 +78,9 @@ async fn builds_a_real_unsigned_fund_transaction() {
         })
         .await;
     match r {
-        Ok(xdr) => println!("unsigned transaction ({} chars of XDR) built and simulated", xdr.len()),
+        Ok(built) => {
+            println!("unsigned transaction ({} chars of XDR) built and simulated, valid until {}", built.xdr.len(), built.valid_until)
+        }
         Err(e) => panic!("build failed: {e} (contract error: {:?})", e.contract_error()),
     }
 }

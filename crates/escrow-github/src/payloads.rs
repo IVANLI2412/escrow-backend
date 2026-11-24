@@ -39,6 +39,17 @@ pub struct InstallationEvent {
     pub repositories: Vec<RepoRef>,
     #[serde(default)]
     pub repositories_added: Vec<RepoRef>,
+    #[serde(default)]
+    pub repositories_removed: Vec<RepoId>,
+}
+
+/// The `repository` webhook. Used for `renamed` and `transferred`, where `repository.full_name` is already
+/// the new name (the old one is only in `changes`, which we do not need).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepositoryEvent {
+    pub action: String,
+    pub installation: Option<InstallationRef>,
+    pub repository: RepoRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]

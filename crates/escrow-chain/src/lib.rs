@@ -27,4 +27,4 @@ pub use keys::Signer;
 pub use ports::{ChainReader, EventSource, ReleaseSigner, TxBuilder};
 pub use relayer::{PreparedRelease, Relayer};
 pub use signer::{SignatureProvider, VaultTransitSigner};
-pub use types::{ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome};
+pub use types::{BuiltTx, ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome};

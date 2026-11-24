@@ -17,6 +17,7 @@ pub struct ApiConfig {
     pub secure_cookies: bool,
     pub admin_github_ids: Vec<i64>,
     pub trust_proxy: bool,
+    pub trust_proxy_hops: usize,
     pub metrics_token: Option<String>,
     pub explorer_tx_template: String,
     pub tokens: Tokens,

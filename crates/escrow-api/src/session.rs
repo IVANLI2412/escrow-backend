@@ -30,9 +30,12 @@ pub struct Authed {
     pub session_id: String,
 }
 
-/// Rate-limit key: the signed-in session (per user), otherwise the client address.
-pub fn limit_key(h: &HeaderMap, ip: &str) -> String {
-    cookie_id(h).map_or_else(|| format!("ip:{ip}"), |id| format!("u:{}", &sha256_hex(&id)[..16]))
+/// Rate-limit key: the authenticated user, otherwise the client address.
+///
+/// Only ever pass an identity that `require_user` has already verified: a forged or unknown cookie
+/// must not be able to borrow a signed-in user's budget.
+pub fn limit_key(user: Option<&Authed>, ip: &str) -> String {
+    user.map_or_else(|| format!("ip:{ip}"), |a| format!("u:{}", &sha256_hex(&a.user.id)[..16]))
 }
 
 /// The signed-in user, or 401. Mutating requests must also carry the CSRF token bound to the session.
@@ -73,11 +76,31 @@ mod tests {
         assert_eq!(cookie_id(&HeaderMap::new()), None);
     }
 
+    fn authed(user_id: &str, session_id: &str) -> Authed {
+        Authed {
+            user: User {
+                id: user_id.into(),
+                github_id: 1,
+                github_login: "u".into(),
+                avatar_url: None,
+                wallet: None,
+                wallet_linked_at: None,
+                is_admin: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            session_id: session_id.into(),
+        }
+    }
+
     #[test]
-    fn the_limit_key_prefers_the_session_and_never_exposes_it() {
-        let id = random_hex::<32>();
-        let k = limit_key(&headers(&format!("se_session={id}")), "1.2.3.4");
-        assert!(k.starts_with("u:") && !k.contains(&id) && k.len() == 18);
-        assert_eq!(limit_key(&HeaderMap::new(), "1.2.3.4"), "ip:1.2.3.4");
+    fn the_limit_key_prefers_the_user_and_never_exposes_it() {
+        let k = limit_key(Some(&authed("user-123", "sess-abc")), "1.2.3.4");
+        assert!(k.starts_with("u:") && !k.contains("user-123") && k.len() == 18);
+        // two sessions of the same user share one key; other users do not
+        assert_eq!(limit_key(Some(&authed("user-123", "sess-xyz")), "1.2.3.4"), k);
+        assert_ne!(limit_key(Some(&authed("user-999", "sess-abc")), "5.6.7.8"), k);
+        // no verified identity: the client address is all we have
+        assert_eq!(limit_key(None, "1.2.3.4"), "ip:1.2.3.4");
     }
 }
