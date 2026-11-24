@@ -92,6 +92,8 @@ pub struct Config {
     pub review_debounce_secs: u64,
     /// believe `X-Forwarded-For` (only when behind a reverse proxy you control)
     pub trust_proxy: bool,
+    /// number of trusted proxy hops to skip from the right of `X-Forwarded-For` (default 1)
+    pub trust_proxy_hops: usize,
     /// when set, `/metrics` requires `Authorization: Bearer <token>`
     pub metrics_token: Option<String>,
     pub indexer_start_ledger: Option<u32>,
@@ -391,6 +393,13 @@ impl Config {
             indexer_lookback_ledgers: r.number("INDEXER_LOOKBACK_LEDGERS", 1000u32),
             review_debounce_secs: r.number("REVIEW_DEBOUNCE_SECS", 300u64),
             trust_proxy: matches!(r.raw("TRUST_PROXY"), Some("1" | "true")),
+            trust_proxy_hops: {
+                let hops = r.number("TRUST_PROXY_HOPS", 1usize);
+                if hops == 0 {
+                    r.errors.push("TRUST_PROXY_HOPS: must be at least 1".into());
+                }
+                hops
+            },
             metrics_token,
             indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
             db_max_connections: r.number("DB_MAX_CONNECTIONS", 10u32),

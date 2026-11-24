@@ -86,6 +86,7 @@ fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_
             secure_cookies,
             admin_github_ids: admins,
             trust_proxy: false,
+            trust_proxy_hops: 1,
             metrics_token: None,
             explorer_tx_template: "https://explorer.example/tx/{hash}".into(),
             tokens: Tokens { usdc: "CUSDC".into(), xlm: "CTOKEN".into() },
@@ -1420,6 +1421,56 @@ async fn x_forwarded_for_is_ignored_unless_the_proxy_is_trusted(pool: PgPool) {
         call(&e.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", format!("10.0.0.{}", i % 250))], None).await;
     }
     let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", "203.0.113.9".into())], None).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn spoofed_left_most_x_forwarded_for_cannot_bypass_rate_limit_when_trust_proxy_enabled(pool: PgPool) {
+    let mut state = env(pool, true, vec![]);
+    // Rebuild router with trust_proxy enabled and 1 trusted hop.
+    let db = state.db;
+    let chain = state.chain;
+    let txb = state.txb;
+    let login = state.login;
+    let app = router(AppState {
+        db: db.clone(),
+        cfg: Arc::new(ApiConfig {
+            csrf_secret: CSRF.into(),
+            session_secret: SESSION.into(),
+            webhook_secret: WEBHOOK_SECRET.into(),
+            api_public_url: "http://localhost:3001".into(),
+            web_public_url: "http://localhost:3000".into(),
+            secure_cookies: false,
+            admin_github_ids: vec![],
+            trust_proxy: true,
+            trust_proxy_hops: 1,
+            metrics_token: None,
+            explorer_tx_template: "https://explorer.example/tx/{hash}".into(),
+            tokens: Tokens { usdc: "CUSDC".into(), xlm: "CTOKEN".into() },
+            network: "testnet".into(),
+            check_indexer_lag: true,
+        }),
+        chain: chain.clone(),
+        txb: txb.clone(),
+        login: Some(login as Arc<dyn GithubLogin>),
+        payouts: PayoutDeps {
+            db: db.clone(),
+            chain,
+            notifier: Arc::new(GithubNotifier { db, gh: Arc::new(FakeGithub::new()) }),
+            web_url: "http://localhost:3000".into(),
+        },
+        limiter: Arc::new(RateLimiter::new(std::time::Duration::from_secs(60))),
+        metrics: Arc::new(Metrics::default()),
+        now: Utc::now,
+    });
+    state.app = app;
+
+    // Rotating the spoofed left-most entry still resolves to the proxy-observed right-most entry (203.0.113.9).
+    for i in 0..300 {
+        let xff = format!("10.0.0.{}, 203.0.113.9", i % 250);
+        call(&state.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", xff)], None).await;
+    }
+    let r = call(&state.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", "198.51.100.77, 203.0.113.9".into())], None).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
 }
 

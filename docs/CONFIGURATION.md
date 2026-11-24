@@ -26,6 +26,7 @@ Secrets never appear in logs or `Debug` output.
 | `API_PUBLIC_URL` | `http://localhost:3001` | Where browsers and GitHub reach the API. **Must be `https://` in production**: it decides whether cookies are `Secure`, and is the OAuth callback base (`{API_PUBLIC_URL}/auth/callback`). |
 | `WEB_PUBLIC_URL` | `http://localhost:3000` | The web app. The only CORS origin; where sign-in returns to; used in links the bot posts. |
 | `TRUST_PROXY` | off | `1`/`true` only behind a reverse proxy you control: then `X-Forwarded-For` identifies callers for rate limiting. Left off, the header is ignored, so it cannot be used to dodge limits. |
+| `TRUST_PROXY_HOPS` | `1` | Number of trusted proxy hops to skip from the right of `X-Forwarded-For` when `TRUST_PROXY` is enabled (`1` when a single proxy like Caddy sits in front, `2` behind CDN + Caddy, etc.), preventing clients from spoofing the left-most entry. |
 | `METRICS_TOKEN` | none (public) | When set, `/metrics` needs `Authorization: Bearer <token>`. Left unset, `/metrics` is public to anyone who can reach the API and exposes bounty, payout and job counts; `doctor` warns. **Required on mainnet** (start-up error). |
 
 ## Stellar
