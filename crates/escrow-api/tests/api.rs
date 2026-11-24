@@ -15,7 +15,7 @@ use escrow_core::{
     oauth::{OAUTH_COOKIE, clear_cookie},
     security::{csrf_token, hash_session_id, hmac_hex, sep53_hash},
 };
-use escrow_db::{Db, MIGRATOR, bounties, disputes, intents, payouts, prs, sessions, users};
+use escrow_db::{Db, MIGRATOR, audit, bounties, disputes, intents, payouts, prs, sessions, users};
 use escrow_engine::sync::{GithubNotifier, Tokens};
 use escrow_github::{GithubUser, OAuthError};
 use escrow_payouts::PayoutDeps;
@@ -162,6 +162,11 @@ async fn signed_in(e: &Env, github_id: i64, login: &str, wallet: Option<&str>, a
 fn stellar(seed_byte: u8) -> (SigningKey, String) {
     let sk = SigningKey::from_bytes(&[seed_byte; 32]);
     (sk.clone(), stellar_strkey::ed25519::PublicKey(sk.verifying_key().to_bytes()).to_string().to_string())
+}
+
+fn assert_valid_until(body: &Value, expected: u64) {
+    let raw = body["validUntil"].as_str().expect("build responses carry validUntil");
+    assert_eq!(chrono::DateTime::parse_from_rfc3339(raw).unwrap().timestamp(), i64::try_from(expected).unwrap(), "{raw}");
 }
 
 async fn fund(e: &Env, id: i64, issue: i32) {
@@ -425,7 +430,9 @@ async fn metrics_are_prometheus_text_and_can_require_a_token(pool: PgPool) {
     let m = get(&e, "/metrics").await;
     assert_eq!(m.status, StatusCode::OK);
     assert!(
-        m.text.contains("# TYPE skillescrow_http_requests_total counter") && m.text.contains("skillescrow_bounties{status=\"OPEN\"} 1"),
+        m.text.contains("# TYPE skillescrow_http_requests_total counter")
+            && m.text.contains("skillescrow_bounties{status=\"OPEN\"} 1")
+            && m.text.contains("skillescrow_metrics_db_up 1"),
         "{}",
         m.text
     );
@@ -603,10 +610,45 @@ async fn linking_a_wallet_needs_a_real_signature_over_the_challenge(pool: PgPool
         call(&e.app, Method::POST, "/wallet/verify", &s.hdrs(true), Some(json!({ "challengeId": id, "signature": sign(&sk, &msg) }))).await;
     assert_eq!((ok.status, ok.body["address"].as_str()), (StatusCode::OK, Some(addr.as_str())));
     assert_eq!(users::get(&pool, &s.user.id).await.unwrap().unwrap().wallet.as_deref(), Some(addr.as_str()));
+    let linked = audit::recent(&pool, 1).await.unwrap().remove(0);
+    assert_eq!(
+        (linked.actor.as_str(), linked.action.as_str(), linked.target.as_str()),
+        ("user:900", "wallet.linked", format!("user:{}", s.user.id).as_str())
+    );
+    assert_eq!(linked.data, json!({ "oldAddress": null, "newAddress": addr }));
     // single use
     let again =
         call(&e.app, Method::POST, "/wallet/verify", &s.hdrs(true), Some(json!({ "challengeId": id, "signature": sign(&sk, &msg) }))).await;
     assert_eq!((again.status, again.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("challenge_used")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn unlinking_a_wallet_is_audited_and_rate_limited(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let (_, addr) = stellar(8);
+    let s = signed_in(&e, 903, "unlinker", Some(&addr), false).await;
+    let uri = "/wallet";
+
+    assert_eq!(call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await.status, StatusCode::OK);
+    assert!(users::get(&pool, &s.user.id).await.unwrap().unwrap().wallet.is_none());
+    let rows = audit::recent(&pool, 50).await.unwrap();
+    let unlinked: Vec<_> = rows.iter().filter(|r| r.action == "wallet.unlinked").collect();
+    assert_eq!(unlinked.len(), 1);
+    assert_eq!(unlinked[0].actor, "user:903");
+    assert_eq!(unlinked[0].target, format!("user:{}", s.user.id));
+    assert_eq!(unlinked[0].data, json!({ "oldAddress": addr, "newAddress": null }));
+
+    for i in 0..19 {
+        assert_eq!(call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await.status, StatusCode::OK, "unlink {i}");
+    }
+    let limited = call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await;
+    assert_eq!((limited.status, limited.body["error"]["code"].clone()), (StatusCode::TOO_MANY_REQUESTS, json!("rate_limited")));
+    assert_eq!(audit::recent(&pool, 50).await.unwrap().iter().filter(|r| r.action == "wallet.unlinked").count(), 20);
+    assert_eq!(
+        call(&e.app, Method::DELETE, uri, &s.hdrs(false), None).await.status,
+        StatusCode::FORBIDDEN,
+        "unlinking still needs a csrf token"
+    );
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -846,6 +888,7 @@ async fn building_the_funding_transaction_checks_who_is_asking(pool: PgPool) {
     assert_eq!(ok.status, StatusCode::OK);
     let xdr = ok.body["xdr"].as_str().unwrap();
     assert!(xdr.starts_with("XDR[fund:") && xdr.contains(&format!(":{}:10:3:CTOKEN:50000000:false", addr)), "{xdr}");
+    assert_valid_until(&ok.body, e.txb.valid_until);
     // the deadline is the duration from now (+60 s of slack), and was passed to the chain builder
     let built = e.txb.built.lock().unwrap().clone();
     assert_eq!(built.len(), 1);
@@ -937,6 +980,7 @@ async fn only_the_maintainers_wallet_can_ask_for_a_release_or_refund(pool: PgPoo
     }
     let ok = call(&e.app, Method::POST, "/bounties/4/refund/build", &maintainer.hdrs(true), None).await;
     assert_eq!((ok.status, ok.body["xdr"].as_str()), (StatusCode::OK, Some(format!("XDR[refund:{}:4]", seed::MAINTAINER_WALLET).as_str())));
+    assert_valid_until(&ok.body, e.txb.valid_until);
     assert_eq!(call(&e.app, Method::POST, "/bounties/9/refund/build", &maintainer.hdrs(true), None).await.status, StatusCode::NOT_FOUND);
 
     // the chain, not the database, decides whether it is still open
@@ -963,6 +1007,7 @@ async fn a_release_is_built_only_for_a_payout_waiting_on_the_maintainer(pool: Pg
         (ok.status, ok.body["winner"].as_str(), ok.body["xdr"].as_str()),
         (StatusCode::OK, Some("GWINNER"), Some(format!("XDR[release:{}:4:GWINNER]", seed::MAINTAINER_WALLET).as_str()))
     );
+    assert_valid_until(&ok.body, e.txb.valid_until);
 
     // a payout the relayer already owns is not the maintainer's to sign
     sqlx::query("UPDATE payouts SET status = 'QUEUED'").execute(&pool).await.unwrap();
@@ -1026,6 +1071,7 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
     )
     .await;
     assert_eq!((open.status, open.body["xdr"].as_str()), (StatusCode::OK, Some(format!("XDR[open_dispute:{arbiter}:4]").as_str())));
+    assert_valid_until(&open.body, e.txb.valid_until);
     assert_eq!(
         call(
             &e.app,
@@ -1083,6 +1129,7 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
     )
     .await;
     assert_eq!(split.body["xdr"].as_str(), Some(format!("XDR[resolve:{arbiter}:4:{winner}:6000]").as_str()));
+    assert_valid_until(&split.body, e.txb.valid_until);
     let refund = call(
         &e.app,
         Method::POST,

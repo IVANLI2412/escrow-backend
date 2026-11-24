@@ -43,6 +43,12 @@ pub struct FundParams {
     pub relayer_allowed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltTx {
+    pub xdr: String,
+    pub valid_until: u64,
+}
+
 /// One page of contract events plus where to resume.
 #[derive(Debug, Clone)]
 pub struct EventsPage {

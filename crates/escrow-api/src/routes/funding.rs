@@ -4,7 +4,7 @@
 use crate::{
     error::{ApiError, ApiResult},
     extract::{ApiJson, ClientIp},
-    routes::auth::mutation_limit,
+    routes::{auth::mutation_limit, prepared_tx},
     session::require_user,
     state::AppState,
 };
@@ -77,7 +77,7 @@ pub async fn build_fund(
         return Err(ApiError::forbidden("not_requester", "this link belongs to another GitHub user"));
     }
     let deadline = u64::try_from(now.timestamp() + i64::from(i.duration_days) * 86_400 + 60).unwrap_or(0);
-    let xdr = s
+    let built = s
         .txb
         .build_fund(&FundParams {
             maintainer: b.address,
@@ -89,7 +89,7 @@ pub async fn build_fund(
             relayer_allowed: b.relayer_allowed,
         })
         .await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -163,8 +163,8 @@ pub async fn build_release(
     let winner =
         p.winner_address.clone().ok_or_else(|| ApiError::conflict("nothing_to_release", "no payout is waiting for your signature"))?;
     require_open_on_chain(&s, b.id).await?;
-    let xdr = s.txb.build_release(&b.maintainer, u64::try_from(b.id).unwrap_or(0), &winner).await?;
-    Ok(Json(json!({ "xdr": xdr, "winner": winner })))
+    let built = s.txb.build_release(&b.maintainer, u64::try_from(b.id).unwrap_or(0), &winner).await?;
+    Ok(Json(prepared_tx(built, Some(&winner))?))
 }
 
 pub async fn build_refund(
@@ -176,6 +176,6 @@ pub async fn build_refund(
     let b = maintainer_bounty(&s, &headers, &ip, &id).await?;
     require_open_on_chain(&s, b.id).await?;
     // the contract enforces deadline + grace itself
-    let xdr = s.txb.build_refund(&b.maintainer, u64::try_from(b.id).unwrap_or(0)).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    let built = s.txb.build_refund(&b.maintainer, u64::try_from(b.id).unwrap_or(0)).await?;
+    Ok(Json(prepared_tx(built, None)?))
 }

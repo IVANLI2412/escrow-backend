@@ -155,7 +155,7 @@ pub async fn wallet_verify(
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
     mutation_limit(&s, &headers, &ip, 20)?;
-    let address = wallet::verify_challenge(&s.db, &a.user.id, &b.challenge_id, &b.signature, (s.now)()).await?;
+    let address = wallet::verify_challenge(&s.db, &a.user, &b.challenge_id, &b.signature, (s.now)()).await?;
     Metrics::inc(&s.metrics.wallets_linked);
     // a payout that was waiting for this wallet continues now; the link itself has already succeeded
     if let Err(e) = on_wallet_linked(&s.payouts, a.user.github_id).await {
@@ -164,9 +164,14 @@ pub async fn wallet_verify(
     Ok(Json(json!({ "address": address })))
 }
 
-pub async fn wallet_unlink(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
+pub async fn wallet_unlink(
+    State(s): State<AppState>,
+    Extension(ip): Extension<ClientIp>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    wallet::unlink(&s.db, &a.user.id).await?;
+    mutation_limit(&s, &headers, &ip, 20)?;
+    wallet::unlink(&s.db, &a.user).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

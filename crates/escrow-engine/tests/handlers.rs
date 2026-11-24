@@ -537,6 +537,12 @@ async fn installing_the_app_registers_the_account_and_its_repositories(pool: PgP
     run(&w, "installation_repositories", &added).await.unwrap();
     assert_eq!(escrow_db::github::list_repos(&pool).await.unwrap().len(), 3);
 
+    let removed = json!({ "action": "removed", "installation": { "id": 77, "account": { "login": "newco", "type": "Organization" } },
+        "repositories_removed": [{ "id": 3, "full_name": "newco/c" }] });
+    run(&w, "installation_repositories", &removed).await.unwrap();
+    assert!(escrow_db::github::get_repo(&pool, 3).await.unwrap().unwrap().suspended_at.is_some());
+    assert_eq!(escrow_db::github::list_repos(&pool).await.unwrap().len(), 3);
+
     // suspend and uninstall keep the rows: bounties still point at them
     for action in ["suspend", "deleted"] {
         let ev = json!({ "action": action, "installation": { "id": 77, "account": { "login": "newco", "type": "Organization" } } });

@@ -3,7 +3,6 @@
 //! Rows are hash-chained by the `audit_log_chain` trigger (migration 0008): each row stores
 //! `seq`, `prev_hash` and `hash`. Use [`verify`] to walk the chain.
 
-use chrono::{DateTime, Utc};
 use crate::new_id;
 use sqlx::PgExecutor;
 
@@ -42,11 +41,9 @@ pub async fn recent<'e>(ex: impl PgExecutor<'e>, limit: i64) -> Result<Vec<crate
 
 /// Counts anomaly_detected audit entries in the last 24 hours.
 pub async fn count_anomalies_24h<'e>(ex: impl PgExecutor<'e>) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_log WHERE action = 'anomaly_detected' AND created_at > NOW() - INTERVAL '24 hours'"
-    )
-    .fetch_one(ex)
-    .await
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'anomaly_detected' AND created_at > NOW() - INTERVAL '24 hours'")
+        .fetch_one(ex)
+        .await
 }
 
 /// The first row where the chain is broken.
@@ -60,9 +57,7 @@ pub struct BrokenLink {
 /// Walks the chain from `from_seq` (1 for the whole table) and returns the first broken link, if any.
 /// Verification runs inside Postgres via `audit_verify()`, so it needs no hashing crate.
 pub async fn verify<'e>(ex: impl PgExecutor<'e>, from_seq: i64) -> Result<Option<BrokenLink>, sqlx::Error> {
-    let row: Option<(i64, String, String)> = sqlx::query_as("SELECT broken_seq, broken_id, reason FROM audit_verify($1)")
-        .bind(from_seq)
-        .fetch_optional(ex)
-        .await?;
+    let row: Option<(i64, String, String)> =
+        sqlx::query_as("SELECT broken_seq, broken_id, reason FROM audit_verify($1)").bind(from_seq).fetch_optional(ex).await?;
     Ok(row.map(|(seq, id, reason)| BrokenLink { seq, id, reason }))
 }
