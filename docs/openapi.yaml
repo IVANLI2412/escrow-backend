@@ -189,7 +189,7 @@ paths:
     post:
       tags: [Wallet]
       summary: Prove you control the address
-      description: Verifies the signature, burns the challenge (single use) and links the wallet. A payout that was waiting for a wallet continues immediately.
+      description: Verifies the signature, burns the challenge (single use) and links the wallet. A payout that was waiting for a wallet continues immediately. The change is written to the audit log with the old and new addresses.
       security: [{ sessionCookie: [], csrf: [] }]
       requestBody:
         required: true
@@ -207,13 +207,18 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
         '410': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /wallet:
     delete:
       tags: [Wallet]
       summary: Unlink your wallet
+      description: Writes an audit entry with the old address and a null new address. Limited to 20 mutations per user or IP per window.
       security: [{ sessionCookie: [], csrf: [] }]
       responses:
         '200': { description: Unlinked, content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /me/earnings:
     get:
       tags: [Me]
@@ -256,7 +261,7 @@ paths:
     post:
       tags: [Funding]
       summary: Prepare the unsigned `fund_bounty` transaction
-      description: Only the GitHub user who typed `/bounty` may use the link. Returns base64 XDR, simulated and ready for the wallet to sign. The server never signs it.
+      description: Only the GitHub user who typed `/bounty` may use the link. Returns base64 XDR, simulated and ready for the wallet to sign, plus `validUntil` (RFC 3339) so the app can warn before the signature expires. The server never signs it.
       security: [{ sessionCookie: [], csrf: [] }]
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       requestBody:
@@ -306,7 +311,7 @@ paths:
       security: [{ sessionCookie: [], csrf: [] }]
       parameters: [{ $ref: '#/components/parameters/BountyId' }]
       responses:
-        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { xdr: { type: string }, winner: { type: string } } } } } }
+        '200': { description: OK, content: { application/json: { schema: { type: object, required: [xdr, validUntil, winner], properties: { xdr: { type: string }, validUntil: { type: string, format: date-time }, winner: { type: string } } } } } }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
@@ -520,7 +525,12 @@ components:
                 returns (e.g. `contract_IssueAlreadyFunded`, `contract_DeadlineNotReached`).
             message: { type: string }
     Ok: { type: object, properties: { ok: { type: boolean } } }
-    Xdr: { type: object, properties: { xdr: { type: string, description: Unsigned, simulated transaction envelope (base64 XDR) for a wallet to sign } } }
+    Xdr:
+      type: object
+      required: [xdr, validUntil]
+      properties:
+        xdr: { type: string, description: Unsigned, simulated transaction envelope (base64 XDR) for a wallet to sign }
+        validUntil: { type: string, format: date-time, description: RFC 3339 time bound of the transaction; the signed XDR is worthless after it }
     BountyStatus: { type: string, enum: [OPEN, RELEASED, REFUNDED, DISPUTED, RESOLVED] }
     PayoutStatus: { type: string, enum: [PENDING_WALLET, QUEUED, SUBMITTED, CONFIRMED, FAILED, AWAITING_MAINTAINER] }
     Health:

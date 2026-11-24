@@ -60,7 +60,8 @@ pub async fn upsert_repo<'e>(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO repos (id, installation_id, full_name, is_private) VALUES ($1,$2,$3,$4)
-         ON CONFLICT (id) DO UPDATE SET installation_id = EXCLUDED.installation_id, full_name = EXCLUDED.full_name, is_private = EXCLUDED.is_private",
+         ON CONFLICT (id) DO UPDATE SET installation_id = EXCLUDED.installation_id, full_name = EXCLUDED.full_name,
+           is_private = EXCLUDED.is_private, suspended_at = NULL",
     )
     .bind(id)
     .bind(installation_id)
@@ -71,17 +72,29 @@ pub async fn upsert_repo<'e>(
     .map(|_| ())
 }
 
+pub async fn suspend_repo<'e>(ex: impl PgExecutor<'e>, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE repos SET suspended_at = NOW() WHERE id = $1").bind(id).execute(ex).await.map(|_| ())
+}
+
+pub async fn unsuspend_repo<'e>(ex: impl PgExecutor<'e>, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE repos SET suspended_at = NULL WHERE id = $1").bind(id).execute(ex).await.map(|_| ())
+}
+
 pub async fn get_repo<'e>(ex: impl PgExecutor<'e>, id: i64) -> Result<Option<Repo>, sqlx::Error> {
-    sqlx::query_as("SELECT id, installation_id, full_name, is_private FROM repos WHERE id = $1").bind(id).fetch_optional(ex).await
+    sqlx::query_as("SELECT id, installation_id, full_name, is_private, suspended_at FROM repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(ex)
+        .await
 }
 
 pub async fn list_repos<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Repo>, sqlx::Error> {
-    sqlx::query_as("SELECT id, installation_id, full_name, is_private FROM repos ORDER BY full_name").fetch_all(ex).await
+    sqlx::query_as("SELECT id, installation_id, full_name, is_private, suspended_at FROM repos ORDER BY full_name").fetch_all(ex).await
 }
 
 /// Whether AI reviews are on for a repository (on unless a `repo_settings` row turns them off).
 pub async fn ai_reviews_enabled<'e>(ex: impl PgExecutor<'e>, repo_id: i64) -> Result<bool, sqlx::Error> {
-    let v: Option<bool> = sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
+    let v: Option<bool> =
+        sqlx::query_scalar("SELECT ai_reviews FROM repo_settings WHERE repo_id = $1").bind(repo_id).fetch_optional(ex).await?;
     Ok(v.unwrap_or(true))
 }
 

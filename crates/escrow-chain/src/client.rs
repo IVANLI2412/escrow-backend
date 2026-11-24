@@ -7,7 +7,7 @@ use crate::{
     ports::{ChainReader, EventSource, TxBuilder},
     rpc::{EventsWire, GetTxWire, LatestLedgerWire, LedgerEntriesWire, RpcClient, SendWire, SimulateWire, SimulationOk, describe_tx_error},
     scval, tx,
-    types::{ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
+    types::{BuiltTx, ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
 };
 use async_trait::async_trait;
 use escrow_core::BountyStatus;
@@ -101,11 +101,13 @@ impl SorobanChain {
     }
 
     /// Builds, simulates and assembles a call for `source` to sign. Returns the unsigned envelope as base64.
-    async fn prepare(&self, source: &str, function: &str, args: Vec<ScVal>) -> Result<String, ChainError> {
+    async fn prepare(&self, source: &str, function: &str, args: Vec<ScVal>) -> Result<BuiltTx, ChainError> {
         let (seq, _) = self.account(source).await?;
         let t = tx::invoke_tx(keys::account_bytes(source)?, seq + 1, self.contract, function, args, tx::now_secs() + USER_TX_VALID_SECS)?;
         let sim = self.simulate(&t).await?;
-        tx::to_b64(&tx::envelope(tx::assemble(t, &sim)?))
+        let built = tx::assemble(t, &sim)?;
+        let valid_until = tx::max_time(&built).ok_or_else(|| ChainError::Decode("prepared transaction has no time bound".into()))?;
+        Ok(BuiltTx { xdr: tx::to_b64(&tx::envelope(built))?, valid_until })
     }
 
     /// Submits a signed envelope; returns the hash. `PENDING` and `DUPLICATE` both mean "it is on its way".
@@ -234,7 +236,7 @@ impl EventSource for SorobanChain {
 
 #[async_trait]
 impl TxBuilder for SorobanChain {
-    async fn build_fund(&self, p: &FundParams) -> Result<String, ChainError> {
+    async fn build_fund(&self, p: &FundParams) -> Result<BuiltTx, ChainError> {
         let args = vec![
             scval::address(&p.maintainer)?,
             scval::u64v(p.repo_id),
@@ -247,20 +249,20 @@ impl TxBuilder for SorobanChain {
         self.prepare(&p.maintainer, "fund_bounty", args).await
     }
 
-    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<String, ChainError> {
+    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<BuiltTx, ChainError> {
         let args = vec![scval::address(maintainer)?, scval::u64v(bounty_id), scval::address(winner)?];
         self.prepare(maintainer, "release", args).await
     }
 
-    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.prepare(maintainer, "refund", vec![scval::address(maintainer)?, scval::u64v(bounty_id)]).await
     }
 
-    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.prepare(arbiter, "open_dispute", vec![scval::address(arbiter)?, scval::u64v(bounty_id)]).await
     }
 
-    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<String, ChainError> {
+    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<BuiltTx, ChainError> {
         let args = vec![scval::address(arbiter)?, scval::u64v(bounty_id), scval::opt_address(winner)?, scval::u32v(winner_bps)];
         self.prepare(arbiter, "resolve", args).await
     }

@@ -98,7 +98,13 @@ pub trait GithubApi: Send + Sync {
     async fn get_readme_excerpt(&self, installation: i64, repo: &str, max_chars: usize) -> Result<String, GithubError>;
     /// A file's text at `git_ref` (the default branch when `None`). `None` when the file is absent, binary or too
     /// large. Used for review context. The default reads nothing, so implementors need not change.
-    async fn get_file_at(&self, _installation: i64, _repo: &str, _git_ref: Option<&str>, _path: &str) -> Result<Option<String>, GithubError> {
+    async fn get_file_at(
+        &self,
+        _installation: i64,
+        _repo: &str,
+        _git_ref: Option<&str>,
+        _path: &str,
+    ) -> Result<Option<String>, GithubError> {
         Ok(None)
     }
     /// All installations of this App (authenticated as the App itself).

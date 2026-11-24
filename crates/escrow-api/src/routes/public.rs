@@ -19,6 +19,9 @@ use escrow_db::{
 use escrow_engine::ops::health_report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Once;
+
+static METRICS_PUBLIC_WARN: Once = Once::new();
 
 pub async fn health(State(s): State<AppState>) -> Response {
     let h = health_report(&s.db, s.chain.as_ref(), s.cfg.check_indexer_lag).await;
@@ -26,6 +29,10 @@ pub async fn health(State(s): State<AppState>) -> Response {
 }
 
 pub async fn metrics(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    if s.cfg.metrics_token.is_none() {
+        METRICS_PUBLIC_WARN
+            .call_once(|| tracing::warn!("METRICS_TOKEN is unset: /metrics is public and exposes bounty, payout and job counts"));
+    }
     if let Some(token) = &s.cfg.metrics_token {
         let given = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if !ct_eq(given, token) {

@@ -30,6 +30,7 @@ impl UntrackedFundedEvent {
 }
 
 /// Stores a Funded event for a repo that doesn't exist yet.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_untracked_funded<'e>(
     ex: impl PgExecutor<'e>,
     event_id: &str,

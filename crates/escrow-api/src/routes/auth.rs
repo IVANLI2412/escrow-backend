@@ -12,7 +12,7 @@ use crate::{
 use axum::{
     Json,
     extract::{Extension, Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Redirect, Response},
 };
 use escrow_core::{
@@ -125,7 +125,7 @@ pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json
 pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let a = require_user(&s, &headers, true).await?;
     session::destroy(&s.db, &a.session_id).await?;
-    let clearing = clear_cookie(SESSION_COOKIE, s.cfg.secure_cookies).parse().expect("ascii");
+    let clearing: HeaderValue = clear_cookie(SESSION_COOKIE, s.cfg.secure_cookies).parse().expect("ascii");
     Ok(([(header::SET_COOKIE, clearing)], Json(json!({ "ok": true }))).into_response())
 }
 
@@ -160,7 +160,7 @@ pub async fn wallet_verify(
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
     mutation_limit(&s, Some(&a), &ip, 20)?;
-    let address = wallet::verify_challenge(&s.db, &a.user.id, &b.challenge_id, &b.signature, (s.now)()).await?;
+    let address = wallet::verify_challenge(&s.db, &a.user, &b.challenge_id, &b.signature, (s.now)()).await?;
     Metrics::inc(&s.metrics.wallets_linked);
     // a payout that was waiting for this wallet continues now; the link itself has already succeeded
     if let Err(e) = on_wallet_linked(&s.payouts, a.user.github_id).await {
@@ -169,9 +169,14 @@ pub async fn wallet_verify(
     Ok(Json(json!({ "address": address })))
 }
 
-pub async fn wallet_unlink(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
+pub async fn wallet_unlink(
+    State(s): State<AppState>,
+    Extension(ip): Extension<ClientIp>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    wallet::unlink(&s.db, &a.user.id).await?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
+    wallet::unlink(&s.db, &a.user).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

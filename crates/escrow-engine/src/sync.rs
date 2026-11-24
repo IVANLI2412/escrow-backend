@@ -10,10 +10,26 @@ use escrow_core::{
     criteria::parse_criteria,
     fees,
 };
-use escrow_db::{Db, audit, bounties, github as gh_repo, payout_reminders, payouts, prs};
+use escrow_db::{
+    Db, audit, bounties, github as gh_repo,
+    models::{Bounty, Repo},
+    payout_reminders, payouts, prs,
+};
 use escrow_github::GithubApi;
 use escrow_payouts::Notifier;
+use sqlx::PgPool;
 use std::sync::Arc;
+
+async fn active_repo(pool: &PgPool, bounty_id: i64) -> Result<Option<(Bounty, Repo)>, EngineError> {
+    let Some((bounty, repo)) = bounties::with_repo(pool, bounty_id).await? else {
+        return Ok(None);
+    };
+    if repo.suspended_at.is_some() {
+        tracing::warn!(bounty = bounty_id, repo = %repo.full_name, "skipping GitHub call for inactive repository");
+        return Ok(None);
+    }
+    Ok(Some((bounty, repo)))
+}
 
 /// Token contract ids, to show symbols instead of addresses.
 #[derive(Clone, Default)]
@@ -60,7 +76,7 @@ pub enum CardOutcome {
 /// Fills the issue title and criteria, posts the card once and edits it in place afterwards, and keeps the
 /// bounty label current. Safe to call repeatedly: every chain event for the bounty calls it.
 pub async fn refresh_bounty_card(d: &SyncDeps, bounty_id: i64) -> Result<CardOutcome, EngineError> {
-    let Some((b, repo)) = bounties::with_repo(&d.db.pool, bounty_id).await? else {
+    let Some((b, repo)) = active_repo(&d.db.pool, bounty_id).await? else {
         return Ok(CardOutcome::Skipped);
     };
     let (inst, name) = (repo.installation_id, repo.full_name.as_str());
@@ -117,7 +133,7 @@ pub async fn refresh_bounty_card(d: &SyncDeps, bounty_id: i64) -> Result<CardOut
 /// "Paid 4.85 XLM to @login (tx)" on the PR, once per bounty. Covers every release path (relayer or the
 /// maintainer signing). Marked in the audit log so a replayed event never comments twice.
 pub async fn announce_payout(d: &SyncDeps, bounty_id: i64) -> Result<bool, EngineError> {
-    let Some((b, repo)) = bounties::with_repo(&d.db.pool, bounty_id).await? else {
+    let Some((b, repo)) = active_repo(&d.db.pool, bounty_id).await? else {
         return Ok(false);
     };
     let (Some(tx), Some(winner)) = (b.close_tx.as_deref(), b.winner_address.as_deref()) else {
@@ -160,7 +176,7 @@ pub struct GithubNotifier {
 #[async_trait]
 impl Notifier for GithubNotifier {
     async fn notify(&self, bounty_id: i64, pr_number: i32, message: &str) -> Result<(), String> {
-        let Some((b, repo)) = bounties::with_repo(&self.db.pool, bounty_id).await.map_err(|e| e.to_string())? else {
+        let Some((b, repo)) = active_repo(&self.db.pool, bounty_id).await.map_err(|e| e.to_string())? else {
             return Ok(());
         };
         let target = if pr_number > 0 { pr_number } else { b.issue_number };
@@ -182,7 +198,7 @@ pub struct GithubCommenter {
 #[async_trait]
 impl IssueCommenter for GithubCommenter {
     async fn comment(&self, bounty_id: i64, body: &str) -> Result<(), EngineError> {
-        if let Some((b, repo)) = bounties::with_repo(&self.db.pool, bounty_id).await? {
+        if let Some((b, repo)) = active_repo(&self.db.pool, bounty_id).await? {
             self.gh.post_comment(repo.installation_id, &repo.full_name, b.issue_number, body).await?;
         }
         Ok(())
@@ -277,7 +293,7 @@ pub fn wallet_linked_body(login: &str) -> String {
 pub async fn send_wallet_reminders(d: &SyncDeps, grace: Duration, now: DateTime<Utc>) -> Result<Vec<String>, EngineError> {
     let mut sent = vec![];
     for p in payout_reminders::waiting(&d.db.pool).await? {
-        let Some((b, repo)) = bounties::with_repo(&d.db.pool, p.bounty_id).await? else {
+        let Some((b, repo)) = active_repo(&d.db.pool, p.bounty_id).await? else {
             continue;
         };
         if !b.status().is_active() || now >= b.deadline + grace {
@@ -330,7 +346,7 @@ pub async fn send_wallet_reminders(d: &SyncDeps, grace: Duration, now: DateTime<
         }
     }
     for p in payout_reminders::linked_after_reminder(&d.db.pool).await? {
-        let Some((b, repo)) = bounties::with_repo(&d.db.pool, p.bounty_id).await? else {
+        let Some((b, repo)) = active_repo(&d.db.pool, p.bounty_id).await? else {
             continue;
         };
         let Some(pr) = prs::for_bounty(&d.db.pool, b.id).await?.into_iter().find(|l| l.number == p.pr_number) else {

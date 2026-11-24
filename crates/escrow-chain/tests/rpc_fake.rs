@@ -181,7 +181,7 @@ async fn build_fund_uses_the_next_sequence_number_and_all_seven_arguments() {
         other => panic!("unexpected {other}"),
     })
     .await;
-    let xdr = fake
+    let built = fake
         .chain()
         .build_fund(&FundParams {
             maintainer: maintainer.clone(),
@@ -194,10 +194,13 @@ async fn build_fund_uses_the_next_sequence_number_and_all_seven_arguments() {
         })
         .await
         .unwrap();
-    let e = decode_envelope(&xdr);
+    let e = decode_envelope(&built.xdr);
     assert!(e.signatures.is_empty(), "the server must never sign a user's transaction");
     assert_eq!(e.tx.seq_num.0, 101);
     assert_eq!(e.tx.fee, 100 + 50_000 + 10_000);
+    assert_eq!(built.valid_until, escrow_chain::tx::max_time(&e.tx).unwrap(), "the expiry must come from the XDR");
+    let now = escrow_chain::tx::now_secs();
+    assert!((now + 590..=now + 600).contains(&built.valid_until), "a wallet gets ten minutes to sign");
     assert!(matches!(e.tx.ext, TransactionExt::V1(_)));
     let call = invoked(&e);
     assert_eq!(call.function_name.to_utf8_string_lossy(), "fund_bounty");
@@ -227,8 +230,8 @@ async fn resolve_encodes_a_missing_winner_as_void() {
         _ => sim_ok(None),
     })
     .await;
-    let xdr = fake.chain().build_resolve(&a.address(), 4, None, 0).await.unwrap();
-    let call_args = decode_envelope(&xdr);
+    let built = fake.chain().build_resolve(&a.address(), 4, None, 0).await.unwrap();
+    let call_args = decode_envelope(&built.xdr);
     let args = &invoked(&call_args).args;
     assert_eq!((args[2].clone(), args[3].clone()), (ScVal::Void, ScVal::U32(0)));
 }
