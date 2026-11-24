@@ -415,7 +415,7 @@ async fn the_full_github_sign_in_flow_creates_a_session(pool: PgPool) {
     let cookies = set_cookies(&done);
     let sess = cookies.iter().find(|c| c.starts_with("se_session=")).unwrap();
     assert!(sess.contains("HttpOnly") && sess.contains("Max-Age=2592000"));
-    assert!(cookies.contains(&clear_cookie(OAUTH_COOKIE)), "the one-time state cookie is cleared");
+    assert!(cookies.contains(&clear_cookie(OAUTH_COOKIE, false)), "the one-time state cookie is cleared");
 
     let me = call(&e.app, Method::GET, "/auth/me", &[("cookie", cookie_pair(sess))], None).await;
     assert_eq!((me.status, me.body["login"].as_str(), me.body["isAdmin"].clone()), (StatusCode::OK, Some("octocat"), json!(true)));
