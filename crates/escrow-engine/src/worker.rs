@@ -175,7 +175,7 @@ pub async fn run_periodic(w: Arc<WorkerDeps>, stop: CancellationToken) {
             _ = reminders.tick() => {
                 let commenter = GithubCommenter { db: w.db.clone(), gh: w.sync.gh.clone() };
                 match send_refund_reminders(&w.db, &commenter, w.grace, &w.sync.web_url, Utc::now()).await {
-                    Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "refund reminders"),
+                    Ok(r) if !r.is_empty() => tracing::info!(sent = ?r.sent, failed = ?r.failed, "refund reminders"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "reminders skipped"),
                 }
