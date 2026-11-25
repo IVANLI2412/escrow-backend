@@ -94,6 +94,14 @@ pub async fn config(State(s): State<AppState>) -> ApiResult<Response> {
 }
 
 pub async fn stats(State(s): State<AppState>) -> ApiResult<Response> {
+    let now = (s.now)();
+    let mut cache = s.stats_cache.lock().await;
+    if let Some(cached) = cache.as_ref()
+        && now - cached.cached_at < chrono::Duration::seconds(30)
+    {
+        return Ok(([(header::CACHE_CONTROL, "public, max-age=30")], Json(cached.data.clone())).into_response());
+    }
+
     let by_status: Vec<(String, i64)> =
         sqlx::query_as("SELECT status, count(*) FROM bounties GROUP BY status")
             .fetch_all(&s.db.pool)
@@ -142,14 +150,16 @@ pub async fn stats(State(s): State<AppState>) -> ApiResult<Response> {
             })
         })
         .collect();
+    let data = json!({
+        "bounties": counts,
+        "openByToken": open_by_token,
+        "contributorsPaid": paid_people
+    });
+    *cache = Some(crate::state::StatsCache { data: data.clone(), cached_at: now });
 
     Ok((
         [(header::CACHE_CONTROL, "public, max-age=30")],
-        Json(json!({
-            "bounties": counts,
-            "openByToken": open_by_token,
-            "contributorsPaid": paid_people
-        })),
+        Json(data),
     )
         .into_response())
 }
@@ -240,14 +250,14 @@ pub async fn list_bounties(
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PrView {
     #[serde(flatten)]
     pr: PullRequest,
     reviews: Vec<AiReview>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Detail {
     #[serde(flatten)]
     pub bounty: Bounty,
@@ -261,9 +271,6 @@ pub struct Detail {
 /// This function is intended to replace repeated `detail_of()` calls when
 /// assembling admin dispute pages.
 ///
-/// NOTE: The batch query functions referenced below need to be implemented
-/// in the escrow_db layer. Their signatures are proposed here and must be
-/// reconciled with the existing database module APIs.
 pub async fn detail_of_many(
     s: &AppState,
     ids: &[i64],
@@ -281,7 +288,7 @@ pub async fn detail_of_many(
     let pr_rows = prs::for_bounties(&s.db.pool, ids).await?;
 
     // Collect PR IDs for the batch review query.
-    let pr_ids: Vec<_> = pr_rows.iter().map(|pr| pr.id).collect();
+    let pr_ids: Vec<i64> = pr_rows.iter().map(|(_, pr)| pr.id).collect();
 
     // Batch fetch all AI reviews for the collected PRs.
     let review_rows = reviews::latest_for_prs(&s.db.pool, &pr_ids).await?;
@@ -291,8 +298,8 @@ pub async fn detail_of_many(
 
     // Group PRs by bounty ID.
     let mut prs_by_bounty: HashMap<i64, Vec<PullRequest>> = HashMap::new();
-    for pr in pr_rows {
-        prs_by_bounty.entry(pr.bounty_id).or_default().push(pr);
+    for (bounty_id, pr) in pr_rows {
+        prs_by_bounty.entry(bounty_id).or_default().push(pr);
     }
 
     // Group reviews by PR ID.

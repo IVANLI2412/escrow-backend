@@ -47,6 +47,9 @@ impl GithubApi for NoGithub {
     async fn set_bounty_label(&self, _i: i64, _r: &str, _n: i32, _l: &str) -> Result<(), GithubError> {
         Err(GithubError::NotConfigured)
     }
+    async fn remove_bounty_label(&self, _i: i64, _r: &str, _n: i32) -> Result<(), GithubError> {
+        Err(GithubError::NotConfigured)
+    }
     async fn get_pull(&self, _i: i64, _r: &str, _n: i32) -> Result<Pull, GithubError> {
         Err(GithubError::NotConfigured)
     }
@@ -237,6 +240,7 @@ impl Runtime {
             payouts: self.payout_deps(),
             limiter: Arc::new(RateLimiter::new(Duration::from_secs(60))),
             metrics: Arc::new(Metrics::default()),
+            stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
             now: Utc::now,
         }
     }

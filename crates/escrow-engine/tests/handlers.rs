@@ -175,16 +175,86 @@ async fn disputes_come_only_from_the_maintainer_or_a_linked_pr_author(pool: PgPo
     assert_eq!(run(&w, "issue_comment", &stranger).await.unwrap(), "denied");
     let author = comment_event("/bounty dispute  it was reviewed unfairly  ", 900, "dev", "User", 3, "open", false);
     assert_eq!(run(&w, "issue_comment", &author).await.unwrap(), "dispute-requested");
-    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute duplicate PR won", "alice")).await.unwrap(), "dispute-requested");
 
     let open = disputes::list_open(&pool).await.unwrap();
-    assert_eq!(open.len(), 2);
+    assert_eq!(open.len(), 1);
     assert_eq!(
         (open[0].opened_by_github_id, open[0].reason.as_str(), open[0].status.as_str()),
         (900, "it was reviewed unfairly", "requested")
     );
     assert!(audit::exists(&pool, "dispute.requested", "bounty:4").await.unwrap());
     assert!(w.gh.bodies().last().unwrap().contains(&format!("A human will review this within {} hours", escrow_core::DISPUTE_RESPONSE_HOURS)));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_second_dispute_while_one_is_open_points_at_the_existing_one(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    seed::bounty(&w.db, &seed::B::new(4, 3)).await;
+
+    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute first", "alice")).await.unwrap(), "dispute-requested");
+    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute second", "alice")).await.unwrap(), "rejected:dispute-open");
+    let reply = w.gh.bodies().pop().unwrap();
+    assert!(reply.contains("A dispute is already open on this bounty") && reply.contains("status: requested"), "{reply}");
+
+    let open = disputes::list_open(&pool).await.unwrap();
+    assert_eq!((open.len(), open[0].reason.as_str()), (1, "first"));
+
+    // the same holds once the arbiter has opened it on chain
+    disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute third", "alice")).await.unwrap(), "rejected:dispute-open");
+    assert!(w.gh.bodies().pop().unwrap().contains("status: opened onchain"));
+    assert_eq!(disputes::count_open(&pool).await.unwrap(), 1);
+
+    // after it is resolved, a new dispute is allowed again (the bounty is Disputed/active until the chain says otherwise)
+    disputes::mark_resolved(&pool, 4).await.unwrap();
+    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute fourth", "alice")).await.unwrap(), "dispute-requested");
+    assert_eq!(disputes::count_open(&pool).await.unwrap(), 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn disputes_on_bounties_that_are_no_longer_active_are_refused(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    seed::bounty(&w.db, &seed::B::new(4, 3)).await;
+
+    for status in [BountyStatus::Released, BountyStatus::Refunded, BountyStatus::Resolved] {
+        sqlx::query("UPDATE bounties SET status = $1 WHERE id = 4").bind(status.as_str()).execute(&pool).await.unwrap();
+        assert_eq!(run(&w, "issue_comment", &say("/bounty dispute too late", "alice")).await.unwrap(), "rejected:inactive", "{status}");
+        let reply = w.gh.bodies().pop().unwrap();
+        assert!(reply.contains(&format!("already {}", status.as_str().to_lowercase())), "{reply}");
+        assert_eq!(disputes::count_open(&pool).await.unwrap(), 0, "{status}");
+        assert!(!audit::exists(&pool, "dispute.requested", "bounty:4").await.unwrap(), "{status}");
+    }
+
+    // an already Disputed bounty is still active, so a request is recorded
+    sqlx::query("UPDATE bounties SET status = 'DISPUTED' WHERE id = 4").execute(&pool).await.unwrap();
+    assert_eq!(run(&w, "issue_comment", &say("/bounty dispute still open", "alice")).await.unwrap(), "dispute-requested");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_dispute_reason_over_the_limit_is_shortened_and_the_user_is_told(pool: PgPool) {
+    use escrow_engine::commands::MAX_DISPUTE_REASON_CHARS;
+    let w = world(pool.clone()).await;
+    seed::bounty(&w.db, &seed::B::new(4, 3)).await;
+
+    let long = "é".repeat(2500); // multi-byte, so the cut must be by characters
+    assert_eq!(run(&w, "issue_comment", &say(&format!("/bounty dispute {long}"), "alice")).await.unwrap(), "dispute-requested");
+    let stored = &disputes::list_open(&pool).await.unwrap()[0].reason;
+    assert_eq!(stored.chars().count(), MAX_DISPUTE_REASON_CHARS);
+    let reply = w.gh.bodies().pop().unwrap();
+    assert!(reply.contains("Dispute recorded."), "{reply}");
+    assert!(reply.contains("longer than 2000 characters, so it was shortened to the first 2000"), "{reply}");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_dispute_reason_at_the_limit_is_kept_whole_without_a_notice(pool: PgPool) {
+    use escrow_engine::commands::MAX_DISPUTE_REASON_CHARS;
+    let w = world(pool.clone()).await;
+    seed::bounty(&w.db, &seed::B::new(4, 3)).await;
+
+    let exact = "x".repeat(MAX_DISPUTE_REASON_CHARS);
+    assert_eq!(run(&w, "issue_comment", &say(&format!("/bounty dispute {exact}"), "alice")).await.unwrap(), "dispute-requested");
+    assert_eq!(disputes::list_open(&pool).await.unwrap()[0].reason, exact);
+    assert_eq!(w.gh.bodies().pop().unwrap(), "Dispute recorded. A human will review this within 48 hours.");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

@@ -173,6 +173,17 @@ impl<'a> Reader<'a> {
             }),
         }
     }
+    /// Like [`Self::number`], but an unset variable stays `None` instead of taking a default.
+    fn optional_number<T: FromStr>(&mut self, k: &str) -> Option<T> {
+        let v = self.raw(k)?;
+        match v.parse() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                self.errors.push(format!("{k}: `{v}` is not a valid number"));
+                None
+            }
+        }
+    }
     fn url(&mut self, k: &str, default: Option<&str>) -> String {
         let v = match (self.raw(k), default) {
             (Some(v), _) => v.to_string(),
@@ -500,7 +511,7 @@ impl Config {
                 hops
             },
             metrics_token,
-            indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
+            indexer_start_ledger: r.optional_number("INDEXER_START_LEDGER"),
             db_max_connections,
             worker_concurrency,
             shared_rate_limits,
@@ -952,5 +963,21 @@ mod tests {
         assert!(Config::from_map(&with(&[("LOG_LEVEL", "escrow_engine=debug")])).is_ok());
         let e = Config::from_map(&with(&[("LOG_LEVEL", "verbose")])).unwrap_err().to_string();
         assert!(e.contains("LOG_LEVEL") && e.contains("not a valid log level"), "error was: {e}");
+    }
+
+    #[test]
+    fn indexer_start_ledger_is_optional_and_numeric() {
+        assert_eq!(Config::from_map(&base()).unwrap().indexer_start_ledger, None);
+        assert_eq!(Config::from_map(&with(&[("INDEXER_START_LEDGER", " 123456 ")])).unwrap().indexer_start_ledger, Some(123_456));
+        // blank counts as unset, like every other variable
+        assert_eq!(Config::from_map(&with(&[("INDEXER_START_LEDGER", "  ")])).unwrap().indexer_start_ledger, None);
+    }
+
+    #[test]
+    fn a_non_numeric_indexer_start_ledger_is_a_config_error() {
+        for bad in ["12o45", "-5", "1.5", "latest", "4294967296"] {
+            let e = Config::from_map(&with(&[("INDEXER_START_LEDGER", bad)])).unwrap_err().to_string();
+            assert!(e.contains(&format!("INDEXER_START_LEDGER: `{bad}` is not a valid number")), "{bad}: {e}");
+        }
     }
 }

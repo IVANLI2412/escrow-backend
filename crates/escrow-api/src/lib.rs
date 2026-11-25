@@ -3,13 +3,15 @@
 //! prepare transactions for a user's wallet, and enqueues webhook work. It never changes a bounty's status
 //! (the indexer does) and never holds a user's key.
 //!
-//! Every response is JSON; errors are `{ "error": { "code", "message" } }`. See `docs/API.md`.
+//! Every response is JSON; errors are `{ "error": { "code", "message", "request_id" } }`, and every
+//! response carries `x-request-id`. See `docs/API.md`.
 
 pub mod error;
 pub mod extract;
 pub mod limiter;
 pub mod login;
 pub mod metrics;
+mod request_id;
 pub mod routes;
 pub mod session;
 pub mod state;
@@ -19,17 +21,18 @@ use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, Request},
     http::{HeaderName, HeaderValue, Method, header},
-    middleware::{Next, from_fn_with_state},
+    middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use error::ApiError;
 use extract::ClientIp;
 use metrics::Metrics;
+use request_id::middleware as request_id_middleware;
 use routes::{admin, auth, funding, public, webhook};
 pub use state::{ApiConfig, AppState};
 use std::{net::SocketAddr, time::Instant};
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, request_id::RequestId, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 const GLOBAL_PER_MINUTE: u32 = 300;
 const BODY_LIMIT: usize = 1 << 20;
@@ -43,10 +46,9 @@ fn client_ip(req: &Request, trust_proxy: bool, trust_proxy_hops: usize) -> Strin
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').map(str::trim).filter(|s| !s.is_empty()).nth(idx))
+        && ip.len() <= 45
     {
-        if ip.len() <= 45 {
-            return ip.to_string();
-        }
+        return ip.to_string();
     }
     req.extensions().get::<ConnectInfo<SocketAddr>>().map_or_else(|| "unknown".into(), |c| c.0.ip().to_string())
 }
@@ -75,7 +77,7 @@ pub fn router(state: AppState) -> Router {
         .allow_origin(HeaderValue::from_str(&state.cfg.web_public_url).expect("WEB_PUBLIC_URL is a valid header value"))
         .allow_credentials(true)
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-csrf-token")])
+        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-csrf-token"), HeaderName::from_static(request_id::HEADER)])
         .max_age(std::time::Duration::from_secs(600));
 
     let mut app = Router::new()
@@ -107,6 +109,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/payouts", get(admin::list_payouts))
         .route("/admin/payouts/{id}/retry", post(admin::retry_payout))
         .route("/admin/status", get(admin::status))
+        .route("/admin/audit", get(admin::list_audit))
         .route("/admin/repos/{id}/ai-reviews", put(admin::set_ai_reviews))
         .route("/github/webhooks", post(webhook::receive).layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT)))
         .fallback(|| async { ApiError::not_found("route") })
@@ -121,11 +124,14 @@ pub fn router(state: AppState) -> Router {
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         ))
-        // spans carry the path only: query strings hold one-time OAuth codes
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|r: &axum::http::Request<_>| tracing::info_span!("http", method = %r.method(), path = %r.uri().path())),
-        );
+        // spans carry the path only: query strings hold one-time OAuth codes. The request id is set by
+        // the outermost layer, so it is already in the extensions when this span is made.
+        .layer(TraceLayer::new_for_http().make_span_with(|r: &axum::http::Request<_>| {
+            let request_id = r.extensions().get::<RequestId>().and_then(|id| id.header_value().to_str().ok()).unwrap_or("unknown");
+            tracing::info_span!("http", method = %r.method(), path = %r.uri().path(), request_id = request_id)
+        }))
+        // outermost: generates/validates the id before tracing and writes it to every response
+        .layer(from_fn(request_id_middleware));
     if secure {
         app = app.layer(SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
@@ -150,7 +156,7 @@ mod tests {
     use axum::{body::Body, extract::ConnectInfo, http::Request};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn req_with_xff(xff: Option<&str>, peer: Option<IpAddr>) -> Request {
+    fn req_with_xff(xff: Option<&str>, peer: Option<IpAddr>) -> Request<Body> {
         let mut b = Request::builder().uri("/bounties");
         if let Some(v) = xff {
             b = b.header("x-forwarded-for", v);

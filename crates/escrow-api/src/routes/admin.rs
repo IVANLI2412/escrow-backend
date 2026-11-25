@@ -9,6 +9,7 @@ use crate::{
         auth::mutation_limit,
         prepared_tx,
         public::{Detail, detail_of},
+        require_chain_status,
     },
     session::{Authed, require_user},
     state::AppState,
@@ -20,9 +21,9 @@ use axum::{
 };
 use chrono::Duration;
 use escrow_chain::keys;
-use escrow_core::PayoutStatus;
+use escrow_core::{BountyStatus, PayoutStatus};
 use escrow_db::{Dispute, audit, disputes, github, jobs, payouts, webhooks};
-use escrow_engine::indexer::CURSOR_ID;
+use escrow_engine::{indexer::CURSOR_ID, jobs as engine_jobs};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -99,6 +100,10 @@ pub async fn open_onchain(
     if d.status != "requested" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}", d.status)));
     }
+    // #134 — building `open_dispute` against a bounty that is no longer Open
+    // on chain would fail at simulation with a raw contract error; refuse up
+    // front with the real chain status instead.
+    require_chain_status(&s, d.bounty_id, BountyStatus::Open).await?;
     let built = s.txb.build_open_dispute(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0)).await?;
     audit_log(&s, &a, "dispute.open_onchain.build", format!("dispute:{}", d.id), json!({ "bounty": d.bounty_id.to_string() })).await?;
     Ok(Json(prepared_tx(built, None)?))
@@ -133,9 +138,12 @@ pub async fn resolve_build(
     if d.status != "opened_onchain" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}; open it on chain first", d.status)));
     }
+    // #134 — resolution only makes sense while the chain itself considers the
+    // bounty Disputed; otherwise the eventual submit would fail at simulation.
+    require_chain_status(&s, d.bounty_id, BountyStatus::Disputed).await?;
     let winner = if b.winner_bps > 0 { b.winner.as_deref() } else { None };
     let built = s.txb.build_resolve(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0), winner, b.winner_bps).await?;
-    disputes::set_note(&s.db.pool, &d.id, &b.note).await?;
+    disputes::set_pending_resolution(&s.db.pool, &d.id, &b.note, winner, b.winner_bps).await?;
     audit_log(&s, &a, "dispute.resolve.build", format!("dispute:{}", d.id), json!({ "winner": b.winner, "bps": b.winner_bps })).await?;
     Ok(Json(prepared_tx(built, None)?))
 }
@@ -160,7 +168,11 @@ pub async fn reject(
     if d.status != "requested" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}", d.status)));
     }
-    disputes::set_status(&s.db.pool, &d.id, "rejected", Some(&b.note)).await?;
+    // The decision and its GitHub comment job commit together: a crash cannot leave one without the other.
+    let mut tx = s.db.pool.begin().await?;
+    disputes::set_status(&mut *tx, &d.id, "rejected", Some(&b.note)).await?;
+    engine_jobs::enqueue_dispute_comment(&mut *tx, d.bounty_id, "rejected", Some(&b.note), &format!("rejected:{}", d.id)).await?;
+    tx.commit().await?;
     audit_log(&s, &a, "dispute.rejected", format!("dispute:{}", d.id), json!({ "note": b.note })).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -259,6 +271,86 @@ pub async fn set_ai_reviews(
     github::set_ai_reviews(&s.db.pool, id, b.enabled).await?;
     audit_log(&s, &a, "repo.ai_reviews", format!("repo:{id}"), json!({ "enabled": b.enabled })).await?;
     Ok(Json(json!({ "ok": true, "aiReviews": b.enabled })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditQuery {
+    actor: Option<String>,
+    action: Option<String>,
+    target_prefix: Option<String>,
+    cursor: Option<String>,
+    limit: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    id: String,
+    actor: String,
+    action: String,
+    target: String,
+    data: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditPage {
+    items: Vec<AuditRow>,
+    next_cursor: Option<String>,
+}
+
+// #133 — Browsing the audit trail from the API saves investigators from going
+// to the database. Rows come back newest-first with keyset pagination over
+// (created_at, id); the cursor is the previous page's trailing `id`.
+pub async fn list_audit(
+    State(s): State<AppState>,
+    Extension(ip): Extension<ClientIp>,
+    headers: HeaderMap,
+    q: Result<Query<AuditQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Json<AuditPage>> {
+    admin(&s, &headers, &ip, false).await?;
+    let Query(q) = q.map_err(|_| ApiError::bad_request("invalid query"))?;
+    fn short_text(v: &Option<String>, label: &str, max: usize) -> ApiResult<()> {
+        if v.as_deref().is_some_and(|s| s.is_empty() || s.chars().count() > max) {
+            return Err(ApiError::bad_request(&format!("invalid {label}")));
+        }
+        Ok(())
+    }
+    short_text(&q.actor, "actor", 200)?;
+    short_text(&q.action, "action", 100)?;
+    short_text(&q.target_prefix, "targetPrefix", 200)?;
+    if q.cursor.as_deref().is_some_and(|c| !id_ok(c)) {
+        return Err(ApiError::bad_request("invalid cursor"));
+    }
+    let limit = match q.limit.as_deref() {
+        None => 50,
+        Some(l) => l.parse::<i64>().ok().filter(|n| (1..=100).contains(n)).ok_or_else(|| ApiError::bad_request("invalid limit"))?,
+    };
+    let filter = audit::Filter {
+        actor: q.actor.as_deref(),
+        action: q.action.as_deref(),
+        target_prefix: q.target_prefix.as_deref(),
+        cursor: q.cursor.as_deref(),
+        limit: limit + 1,
+    };
+    let mut rows = audit::list(&s.db.pool, &filter).await?;
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_cursor = if more { rows.last().map(|r| r.id.clone()) } else { None };
+    let items = rows
+        .into_iter()
+        .map(|r| AuditRow {
+            id: r.id,
+            actor: r.actor,
+            action: r.action,
+            target: r.target,
+            data: r.data,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(Json(AuditPage { items, next_cursor }))
 }
 
 pub async fn status(
