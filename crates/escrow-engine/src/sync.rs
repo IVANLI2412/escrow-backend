@@ -205,6 +205,30 @@ impl IssueCommenter for GithubCommenter {
     }
 }
 
+/// Text of the dispute outcome comment. `note` is only meaningful for an admin rejection.
+pub fn dispute_comment_body(kind: &str, note: Option<&str>) -> String {
+    match kind {
+        "disputed" => "A dispute was opened on chain for this bounty. It is awaiting review by an admin.".into(),
+        "resolved" => "The dispute on this bounty was resolved on chain.".into(),
+        "rejected" => format!("The dispute on this bounty was rejected by the arbiter: {}", note.unwrap_or_default()),
+        other => note.unwrap_or(other).to_owned(),
+    }
+}
+
+/// Posts a dispute outcome on the bounty's issue at most once per event/decision. The audit marker is
+/// written only after GitHub accepts the comment, so a failed call is retried by the job queue.
+pub async fn post_dispute_comment(d: &SyncDeps, bounty_id: i64, body: &str, key: &str) -> Result<bool, EngineError> {
+    let target = format!("dispute.comment:{key}");
+    if audit::exists(&d.db.pool, "dispute.commented", &target).await? {
+        return Ok(false);
+    }
+    if let Some((b, repo)) = active_repo(&d.db.pool, bounty_id).await? {
+        d.gh.post_comment(repo.installation_id, &repo.full_name, b.issue_number, body).await?;
+    }
+    audit::log(&d.db.pool, "system", "dispute.commented", &target, &serde_json::json!({ "body": body })).await?;
+    Ok(true)
+}
+
 /// What one reminder pass did: the reminders that went out and the ones whose comment failed, each as `kind:bounty_id`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReminderReport {

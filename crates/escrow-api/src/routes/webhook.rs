@@ -1,4 +1,5 @@
 //! `POST /github/webhooks`: verify, de-duplicate, enqueue. All real work happens in the worker.
+//! A delivery that ended in error is not a duplicate: GitHub's "Redeliver" must be able to retry it.
 
 use crate::{error::ApiError, metrics::Metrics, state::AppState};
 use axum::{
@@ -49,8 +50,13 @@ pub async fn receive(State(s): State<AppState>, headers: HeaderMap, body: Bytes)
     // the delivery record and its job are written together: neither can exist without the other
     let mut tx = s.db.pool.begin().await?;
     if !webhooks::insert_delivery(&mut *tx, id, event).await? {
-        Metrics::inc(&s.metrics.webhooks_duplicate);
-        return Ok((StatusCode::OK, Json(json!({ "duplicate": true }))).into_response());
+        // mark_processed stores terminal failures in `error`; a redelivery of one of those must be
+        // queued again. The conditional update is atomic, so two simultaneous redeliveries cannot both win.
+        if !webhooks::retry_failed_delivery(&mut *tx, id).await? {
+            Metrics::inc(&s.metrics.webhooks_duplicate);
+            return Ok((StatusCode::OK, Json(json!({ "duplicate": true }))).into_response());
+        }
+        tracing::info!(delivery_id = %id, event = %event, "retrying a webhook whose first attempt failed");
     }
     enqueue_webhook(&mut *tx, id, event, &payload).await?;
     tx.commit().await?;

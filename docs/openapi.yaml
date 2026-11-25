@@ -11,7 +11,7 @@ info:
     **Conventions**
     - JSON everywhere. 64-bit ids (`id`, `repoId`, `githubId`, ...) are **strings**; amounts are **strings** of base units
       (7 decimals: `"50000000"` = 5 tokens).
-    - Errors are always `{ "error": { "code": "...", "message": "..." } }`. `code` is stable; `message` is for people.
+    - Every response carries `x-request-id` (a well-formed caller value or a generated UUID), also included in error bodies and tracing spans. Errors are `{ "error": { "code": "...", "message": "...", "request_id": "..." } }`.
     - Sessions are an `HttpOnly` cookie (`se_session`). Every state-changing request also needs the CSRF token from
       `GET /auth/me` in the `X-CSRF-Token` header.
     - Cursor pagination: pass the previous page's `nextCursor`.
@@ -569,7 +569,7 @@ components:
       properties:
         error:
           type: object
-          required: [code, message]
+          required: [code, message, request_id]
           properties:
             code:
               type: string
@@ -578,6 +578,7 @@ components:
                 `chain_unavailable`, `state_archived`, and `contract_<Name>` for any error the escrow contract itself
                 returns (e.g. `contract_IssueAlreadyFunded`, `contract_DeadlineNotReached`).
             message: { type: string }
+            request_id: { type: string, description: The `x-request-id` for this request; quote it in support requests }
     Ok: { type: object, properties: { ok: { type: boolean } } }
     Xdr:
       type: object

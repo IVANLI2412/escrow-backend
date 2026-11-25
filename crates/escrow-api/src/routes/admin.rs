@@ -23,7 +23,7 @@ use chrono::Duration;
 use escrow_chain::keys;
 use escrow_core::{BountyStatus, PayoutStatus};
 use escrow_db::{Dispute, audit, disputes, github, jobs, payouts, webhooks};
-use escrow_engine::indexer::CURSOR_ID;
+use escrow_engine::{indexer::CURSOR_ID, jobs as engine_jobs};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -168,7 +168,11 @@ pub async fn reject(
     if d.status != "requested" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}", d.status)));
     }
-    disputes::set_status(&s.db.pool, &d.id, "rejected", Some(&b.note)).await?;
+    // The decision and its GitHub comment job commit together: a crash cannot leave one without the other.
+    let mut tx = s.db.pool.begin().await?;
+    disputes::set_status(&mut *tx, &d.id, "rejected", Some(&b.note)).await?;
+    engine_jobs::enqueue_dispute_comment(&mut *tx, d.bounty_id, "rejected", Some(&b.note), &format!("rejected:{}", d.id)).await?;
+    tx.commit().await?;
     audit_log(&s, &a, "dispute.rejected", format!("dispute:{}", d.id), json!({ "note": b.note })).await?;
     Ok(Json(json!({ "ok": true })))
 }
