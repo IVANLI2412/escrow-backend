@@ -94,6 +94,14 @@ pub async fn config(State(s): State<AppState>) -> ApiResult<Response> {
 }
 
 pub async fn stats(State(s): State<AppState>) -> ApiResult<Response> {
+    let now = (s.now)();
+    let mut cache = s.stats_cache.lock().await;
+    if let Some(cached) = cache.as_ref()
+        && now - cached.cached_at < chrono::Duration::seconds(30)
+    {
+        return Ok(([(header::CACHE_CONTROL, "public, max-age=30")], Json(cached.data.clone())).into_response());
+    }
+
     let by_status: Vec<(String, i64)> =
         sqlx::query_as("SELECT status, count(*) FROM bounties GROUP BY status")
             .fetch_all(&s.db.pool)
@@ -142,14 +150,16 @@ pub async fn stats(State(s): State<AppState>) -> ApiResult<Response> {
             })
         })
         .collect();
+    let data = json!({
+        "bounties": counts,
+        "openByToken": open_by_token,
+        "contributorsPaid": paid_people
+    });
+    *cache = Some(crate::state::StatsCache { data: data.clone(), cached_at: now });
 
     Ok((
         [(header::CACHE_CONTROL, "public, max-age=30")],
-        Json(json!({
-            "bounties": counts,
-            "openByToken": open_by_token,
-            "contributorsPaid": paid_people
-        })),
+        Json(data),
     )
         .into_response())
 }
