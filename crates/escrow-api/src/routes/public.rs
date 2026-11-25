@@ -93,13 +93,11 @@ pub async fn config(State(s): State<AppState>) -> ApiResult<Response> {
     Ok(([(header::CACHE_CONTROL, "public, max-age=30")], Json(body)).into_response())
 }
 
-const STATS_CACHE_TTL: chrono::Duration = chrono::Duration::seconds(30);
-
 pub async fn stats(State(s): State<AppState>) -> ApiResult<Response> {
     let now = (s.now)();
     let mut cache = s.stats_cache.lock().await;
     if let Some(cached) = cache.as_ref()
-        && now - cached.cached_at < STATS_CACHE_TTL
+        && now - cached.cached_at < chrono::Duration::seconds(30)
     {
         return Ok(([(header::CACHE_CONTROL, "public, max-age=30")], Json(cached.data.clone())).into_response());
     }

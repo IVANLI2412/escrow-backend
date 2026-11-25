@@ -104,6 +104,7 @@ fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_
         },
         limiter: Arc::new(RateLimiter::new(std::time::Duration::from_secs(60))),
         metrics: Arc::new(Metrics::default()),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         now: Utc::now,
     };
     Env { app: router(state), db, chain, txb, login }
@@ -1468,6 +1469,7 @@ async fn spoofed_left_most_x_forwarded_for_cannot_bypass_rate_limit_when_trust_p
         },
         limiter: Arc::new(RateLimiter::new(std::time::Duration::from_secs(60))),
         metrics: Arc::new(Metrics::default()),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         now: Utc::now,
     });
     state.app = app;
