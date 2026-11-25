@@ -4,7 +4,7 @@
 use crate::{
     error::{ApiError, ApiResult},
     extract::{ApiJson, ClientIp},
-    routes::{auth::mutation_limit, prepared_tx},
+    routes::{auth::mutation_limit, prepared_tx, require_chain_status},
     session::require_user,
     state::AppState,
 };
@@ -141,13 +141,11 @@ async fn maintainer_bounty(s: &AppState, headers: &HeaderMap, ip: &ClientIp, id:
     Ok(b)
 }
 
+// #134 — `require_open_on_chain` used to live here and was duplicated by the
+// admin dispute routes against a different expected status. The check now
+// lives in `routes::require_chain_status`, shared by both call sites.
 async fn require_open_on_chain(s: &AppState, id: i64) -> ApiResult<()> {
-    // never trust the database for a money decision
-    let chain = s.chain.get_bounty(u64::try_from(id).unwrap_or(0)).await?;
-    if chain.status != BountyStatus::Open {
-        return Err(ApiError::conflict("not_open", &format!("bounty is {}", chain.status)));
-    }
-    Ok(())
+    require_chain_status(s, id, BountyStatus::Open).await
 }
 
 pub async fn build_release(

@@ -18,6 +18,27 @@ pub struct DispatchDeps {
     pub pulls: PullDeps,
 }
 
+/// #127 — Webhook events `dispatch_webhook` can act on. Any event not in this
+/// list is dropped as `"ignored"` in the match below, so there is no reason to
+/// burn a delivery row and a job on it.
+///
+/// Keep this in sync with the arms of `dispatch_webhook`; the `receive`
+/// handler consults it to decide what to enqueue.
+pub const HANDLED_WEBHOOK_EVENTS: &[&str] = &[
+    "installation",
+    "installation_repositories",
+    "repository",
+    "issue_comment",
+    "pull_request",
+    "issues",
+];
+
+/// Returns `true` when the engine has a handler for `event`. The webhook
+/// receiver uses this as the queue filter.
+pub fn is_handled_webhook_event(event: &str) -> bool {
+    HANDLED_WEBHOOK_EVENTS.contains(&event)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(payload: &Value, what: &str) -> Result<T, EngineError> {
     serde_json::from_value(payload.clone()).map_err(|e| EngineError::Payload(format!("{what}: {e}")))
 }
