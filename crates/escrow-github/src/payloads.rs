@@ -39,6 +39,17 @@ pub struct InstallationEvent {
     pub repositories: Vec<RepoRef>,
     #[serde(default)]
     pub repositories_added: Vec<RepoRef>,
+    #[serde(default)]
+    pub repositories_removed: Vec<RepoId>,
+}
+
+/// The `repository` webhook. Used for `renamed` and `transferred`, where `repository.full_name` is already
+/// the new name (the old one is only in `changes`, which we do not need).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepositoryEvent {
+    pub action: String,
+    pub installation: Option<InstallationRef>,
+    pub repository: RepoRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +123,27 @@ pub struct PullRequestEvent {
     pub action: String,
     pub repository: RepoId,
     pub pull_request: PullRef,
+    /// Present only on `edited`: which fields changed, each as `{ "from": ... }`. Used to skip reviews
+    /// for edits that touch neither the body nor the base branch (e.g. a title-only edit).
+    #[serde(default)]
+    pub changes: Option<PullRequestChanges>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PullRequestChanges {
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    #[serde(default)]
+    pub base: Option<serde_json::Value>,
+    #[serde(default)]
+    pub title: Option<serde_json::Value>,
+}
+
+impl PullRequestChanges {
+    /// True when the edit changed the PR body or its base branch, the only edits worth a fresh review.
+    pub fn affects_review(&self) -> bool {
+        self.body.is_some() || self.base.is_some()
+    }
 }
 
 #[cfg(test)]

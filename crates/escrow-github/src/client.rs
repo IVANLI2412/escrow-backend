@@ -13,7 +13,11 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::LazyLock, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
 
 static REPO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").unwrap());
@@ -27,6 +31,12 @@ const WRITE_SPACING: Duration = Duration::from_secs(1);
 const DEFAULT_PAUSE_SECS: i64 = 60;
 /// Bound on cached ETag responses, so the cache cannot grow without limit.
 const ETAG_CACHE_MAX: usize = 1024;
+/// Bound on paginated list calls, so a looping Link header can never spin forever.
+const MAX_LIST_PAGES: usize = 100;
+/// How long a permission answer (write / none / ...) is reused before asking GitHub again.
+const PERMISSION_TTL_SECS: i64 = 60;
+/// (installation, repo, login) -> (permission, expires at): only "ok" answers are cached, never errors
+type PermissionCache = HashMap<(i64, String, String), (String, DateTime<Utc>)>;
 
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^bounty: [A-Za-z0-9_ .]{1,40}$").unwrap());
 static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_./-]{1,300}$").unwrap());
@@ -123,6 +133,22 @@ pub(crate) fn write_wait(last: Option<Instant>, now: Instant) -> Duration {
     }
 }
 
+/// Extracts the `rel="next"` path from a GitHub `Link` header, rejecting cross-origin URLs.
+pub(crate) fn next_link(headers: &reqwest::header::HeaderMap, api_base: &str) -> Option<String> {
+    let raw = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in raw.split(',') {
+        let mut segments = part.split(';').map(str::trim);
+        let url = segments.next()?.strip_prefix('<')?.strip_suffix('>')?;
+        if segments.any(|s| s == r#"rel="next""# || s == "rel=next")
+            && let Some(rest) = url.strip_prefix(api_base)
+            && rest.starts_with('/')
+        {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 pub struct GithubClient {
     http: reqwest::Client,
     api: String,
@@ -132,6 +158,8 @@ pub struct GithubClient {
     throttles: Mutex<HashMap<i64, Throttle>>,
     /// installation + path -> (ETag, body) for conditional GETs
     etags: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    /// (installation, repo, login) -> (permission, expires at): only "ok" answers are cached, never errors
+    permissions: Mutex<PermissionCache>,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
@@ -140,7 +168,7 @@ impl GithubClient {
         let pem = cfg.private_key.replace("\\n", "\n");
         let key = EncodingKey::from_rsa_pem(pem.as_bytes())
             .map_err(|_| GithubError::Invalid("GITHUB_APP_PRIVATE_KEY is not a valid RSA PEM key".into()))?;
-        let http = reqwest::Client::builder().timeout(cfg.timeout).user_agent("skillescrow-backend").build()?;
+        let http = reqwest::Client::builder().timeout(cfg.timeout).user_agent(escrow_core::USER_AGENT).build()?;
         Ok(Self {
             http,
             api: cfg.api_url.trim_end_matches('/').to_string(),
@@ -149,6 +177,7 @@ impl GithubClient {
             tokens: Mutex::default(),
             throttles: Mutex::default(),
             etags: Mutex::default(),
+            permissions: Mutex::default(),
             now: Box::new(Utc::now),
         })
     }
@@ -315,9 +344,7 @@ impl GithubClient {
             return Err(GithubError::Status { status: r.status().as_u16(), what });
         }
         let etag = r.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_owned);
-        if cacheable
-            && let Some(tag) = etag
-        {
+        if cacheable && let Some(tag) = etag {
             let bytes = r.bytes().await?.to_vec();
             let value = serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(e.to_string()))?;
             let mut cache = self.etags.lock().await;
@@ -337,20 +364,30 @@ impl GithubApi for GithubClient {
         if !LOGIN.is_match(login) {
             return Err(GithubError::Invalid("invalid login".into()));
         }
+        let key = (installation, repo.to_owned(), login.to_owned());
+        let now = (self.now)();
+        if let Some((permission, expires_at)) = self.permissions.lock().await.get(&key)
+            && *expires_at > now
+        {
+            return Ok(permission.clone());
+        }
         let r = self
             .call(installation, reqwest::Method::GET, &format!("/repos/{}/collaborators/{login}/permission", repo_ok(repo)?), None)
             .await?;
-        if r.status().as_u16() == 404 {
-            return Ok("none".into());
-        }
-        if !r.status().is_success() {
+        let permission = if r.status().as_u16() == 404 {
+            "none".into()
+        } else if !r.status().is_success() {
             return Err(GithubError::Status { status: r.status().as_u16(), what: "permission lookup".into() });
-        }
-        #[derive(Deserialize)]
-        struct P {
-            permission: String,
-        }
-        Ok(r.json::<P>().await.map_err(|e| GithubError::Decode(e.to_string()))?.permission)
+        } else {
+            #[derive(Deserialize)]
+            struct P {
+                permission: String,
+            }
+            r.json::<P>().await.map_err(|e| GithubError::Decode(e.to_string()))?.permission
+        };
+        // only an answer GitHub actually gave is worth caching; a failure is never cached
+        self.permissions.lock().await.insert(key, (permission.clone(), now + chrono::Duration::seconds(PERMISSION_TTL_SECS)));
+        Ok(permission)
     }
 
     async fn post_comment(&self, installation: i64, repo: &str, issue: i32, body: &str) -> Result<i64, GithubError> {
@@ -513,17 +550,19 @@ impl GithubApi for GithubClient {
     }
 
     async fn list_installations(&self) -> Result<Vec<InstallationInfo>, GithubError> {
-        let r = self
-            .http
-            .get(format!("{}/app/installations?per_page=100", self.api))
-            .headers(self.base_headers())
-            .bearer_auth(self.app_jwt()?)
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            return Err(GithubError::Status { status: r.status().as_u16(), what: "list installations".into() });
+        let mut out = Vec::new();
+        let mut next = Some("/app/installations?per_page=100".to_string());
+        for _ in 0..MAX_LIST_PAGES {
+            let Some(path) = next else { break };
+            let r = self.http.get(format!("{}{path}", self.api)).headers(self.base_headers()).bearer_auth(self.app_jwt()?).send().await?;
+            if !r.status().is_success() {
+                return Err(GithubError::Status { status: r.status().as_u16(), what: "list installations".into() });
+            }
+            next = next_link(r.headers(), &self.api);
+            let page: Vec<InstallationInfo> = r.json().await.map_err(|e| GithubError::Decode(e.to_string()))?;
+            out.extend(page);
         }
-        r.json().await.map_err(|e| GithubError::Decode(e.to_string()))
+        Ok(out)
     }
 
     async fn list_repositories(&self, installation: i64) -> Result<Vec<RepoInfo>, GithubError> {
@@ -531,7 +570,19 @@ impl GithubApi for GithubClient {
         struct R {
             repositories: Vec<RepoInfo>,
         }
-        Ok(self.json::<R>(installation, reqwest::Method::GET, "/installation/repositories?per_page=100", None).await?.repositories)
+        let mut out = Vec::new();
+        let mut next = Some("/installation/repositories?per_page=100".to_string());
+        for _ in 0..MAX_LIST_PAGES {
+            let Some(path) = next else { break };
+            let r = self.call(installation, reqwest::Method::GET, &path, None).await?;
+            if !r.status().is_success() {
+                return Err(GithubError::Status { status: r.status().as_u16(), what: "list repositories".into() });
+            }
+            next = next_link(r.headers(), &self.api);
+            let page: R = r.json().await.map_err(|e| GithubError::Decode(e.to_string()))?;
+            out.extend(page.repositories);
+        }
+        Ok(out)
     }
 }
 
@@ -572,5 +623,26 @@ mod tests {
         assert_eq!(write_wait(None, t0), Duration::ZERO);
         assert_eq!(write_wait(Some(t0), t0), WRITE_SPACING);
         assert_eq!(write_wait(Some(t0), t0 + WRITE_SPACING), Duration::ZERO);
+    }
+
+    #[test]
+    fn next_link_parses_same_origin_next_and_rejects_other_hosts() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="next", <https://api.github.com/installation/repositories?per_page=100&page=4>; rel="last""#
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(next_link(&h, "https://api.github.com"), Some("/installation/repositories?per_page=100&page=2".into()));
+
+        h.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/installation/repositories?per_page=100&page=1>; rel="prev""#.parse().unwrap(),
+        );
+        assert_eq!(next_link(&h, "https://api.github.com"), None);
+
+        h.insert(reqwest::header::LINK, r#"<https://evil.example/steal>; rel="next""#.parse().unwrap());
+        assert_eq!(next_link(&h, "https://api.github.com"), None);
     }
 }

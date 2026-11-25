@@ -12,10 +12,10 @@ pub mod error;
 pub mod events;
 pub mod keys;
 pub mod ports;
-pub mod signer;
 pub mod relayer;
 pub mod rpc;
 pub mod scval;
+pub mod signer;
 pub mod tx;
 pub mod types;
 
@@ -27,4 +27,4 @@ pub use keys::Signer;
 pub use ports::{ChainReader, EventSource, ReleaseSigner, TxBuilder};
 pub use relayer::{PreparedRelease, Relayer};
 pub use signer::{SignatureProvider, VaultTransitSigner};
-pub use types::{ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome};
+pub use types::{BuiltTx, ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome};

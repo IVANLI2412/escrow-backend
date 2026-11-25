@@ -215,7 +215,7 @@ stateDiagram-v2
 
 - **Enqueue in the same transaction as the cause.** The webhook receiver inserts the delivery row and its job together; the indexer enqueues card refreshes with the events. Neither can exist without the other.
 - **Claim** with `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)`: many workers, no double-claims. A claim is a **lease** (3 minutes). A worker that dies lets its lease lapse and the job is claimed again, until its attempts run out.
-- **Retry** with exponential backoff (4 s, 8 s … 15 min). A failure that can never succeed (a malformed payload, a permission failure) is **buried immediately** as `dead` with its reason, not retried five times. `GithubError::NotConfigured` is deliberately retryable, so jobs wait for the App to be configured.
+- **Retry** with exponential backoff (4 s, 8 s … 15 min). A failure that can never succeed (a malformed payload, a permission failure) is **buried immediately** as `dead` with its reason, not retried five times. While the GitHub App is not configured the worker does not claim GitHub jobs at all, so they wait in the queue (counted by `doctor` and `/admin/status`) instead of retrying until they die.
 - **Dedupe and debounce**: a unique partial index on `dedupe_key` while `status = 'queued'`. Card refreshes collapse (many events for one bounty = one refresh). Review requests **debounce**: a newer push moves the waiting review later instead of adding another (5-minute quiet period).
 - **Observability**: `dead` jobs raise an alert and appear in `/health`, `/admin/status` and `/metrics`.
 
@@ -240,7 +240,7 @@ Advisory and isolated. Defence in layers: untrusted text is **fenced** (and the 
 | Submitted transaction never appears | After 5 minutes it provably cannot land; if the chain still says OPEN it is resubmitted. |
 | Soroban RPC down | The indexer and relayer retry; `/health` goes 503 once the indexer is 60+ ledgers behind; alerts fire. |
 | GitHub down or rate-limited | Jobs retry with backoff; payouts are unaffected (comments are best effort). |
-| GitHub App not configured | The API and indexer still run; GitHub-dependent jobs wait (retryable). |
+| GitHub App not configured | The API and indexer still run; GitHub-dependent jobs stay queued, unclaimed, until it is. |
 | Database down | `/health` 503; jobs and the indexer resume when it returns. Nothing is acknowledged that was not stored. |
 | Malformed tracked contract event | The page is rolled back and the indexer stops advancing, loudly, rather than indexing something wrong. |
 | Lost database | Re-index (`escrowd reindex`) restores bounty state; restore a backup for GitHub bookkeeping (see the runbook). |

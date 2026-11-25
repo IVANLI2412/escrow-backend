@@ -7,7 +7,7 @@ use escrow_core::{
     command::{Command, TokenSymbol, parse_command},
     security::random_b64url,
 };
-use escrow_db::{Db, audit, bounties, disputes, intents, prs};
+use escrow_db::{Db, audit, bounties, disputes, github, intents, prs};
 use escrow_github::{GithubApi, payloads::IssueCommentEvent};
 use std::sync::Arc;
 
@@ -46,6 +46,7 @@ const WRITERS: [&str; 3] = ["admin", "maintain", "write"];
 const HELP: &str = "**SkillEscrow commands**\n\
 - `/bounty <amount> [USDC|XLM] [<days>d]` fund this issue, e.g. `/bounty 50 USDC 14d` (needs write access)\n\
 - `/bounty dispute <reason>` flag a problem on a bountied issue\n\
+- `/bounty review` request an AI review of a PR (PRs only, needs write access)\n\
 - `/bounty help`";
 
 /// What happened, as a short label for logs and tests. User mistakes get a friendly reply and are not errors;
@@ -89,6 +90,10 @@ pub async fn handle_issue_comment(d: &CommandDeps, ev: &IssueCommentEvent) -> Re
             let Some(reviews) = &d.reviews else {
                 return Ok("ignored:reviews-disabled".into());
             };
+            if !github::ai_reviews_enabled(&d.db.pool, ev.repository.id).await? {
+                reply("AI reviews are turned off for this repository.".into()).await?;
+                return Ok("ignored:repo-opted-out".into());
+            }
             reviews.schedule(pr.id, std::time::Duration::ZERO, true).await.map_err(EngineError::Other)?;
             reply("Re-review queued. The review comment on this PR will be updated shortly.".into()).await?;
             Ok("review-requested".into())
@@ -114,14 +119,10 @@ pub async fn handle_issue_comment(d: &CommandDeps, ev: &IssueCommentEvent) -> Re
                 &serde_json::json!({ "dispute": dsp.id }),
             )
             .await?;
-            reply("Dispute recorded. A human will review this within 48 hours.".into()).await?;
+            reply(format!("Dispute recorded. A human will review this within {} hours.", escrow_core::DISPUTE_RESPONSE_HOURS)).await?;
             Ok("dispute-requested".into())
         }
         Command::Fund { amount, token, days } => {
-            if !WRITERS.contains(&d.gh.get_permission(inst, repo, login).await?.as_str()) {
-                reply(format!("@{login} only collaborators with write access can fund a bounty.")).await?;
-                return Ok("denied".into());
-            }
             if ev.issue.pull_request.is_some() {
                 reply("Bounties can only be placed on issues, not pull requests.".into()).await?;
                 return Ok("rejected:pr".into());
@@ -146,6 +147,10 @@ pub async fn handle_issue_comment(d: &CommandDeps, ev: &IssueCommentEvent) -> Re
             if days < d.min_days || days > d.max_days {
                 reply(format!("Duration must be between {} and {} days.", d.min_days, d.max_days)).await?;
                 return Ok("rejected:duration".into());
+            }
+            if !WRITERS.contains(&d.gh.get_permission(inst, repo, login).await?.as_str()) {
+                reply(format!("@{login} only collaborators with write access can fund a bounty.")).await?;
+                return Ok("denied".into());
             }
 
             // Store the link first, then announce it, so a link in a comment always exists.

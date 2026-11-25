@@ -13,6 +13,16 @@ pub const CARD_REFRESH: &str = "card.refresh";
 pub const PAYOUT_ANNOUNCE: &str = "payout.announce";
 pub const REVIEW: &str = "review";
 pub const ALL_KINDS: [&str; 4] = [WEBHOOK, CARD_REFRESH, PAYOUT_ANNOUNCE, REVIEW];
+/// Kinds that call GitHub (a webhook's commands reply with comments). Not claimed while the App is not configured.
+pub const GITHUB_KINDS: [&str; 4] = [WEBHOOK, CARD_REFRESH, PAYOUT_ANNOUNCE, REVIEW];
+
+/// Queued jobs that need GitHub. While the App is not configured, these are waiting for it.
+pub async fn count_waiting_for_github<'e>(ex: impl PgExecutor<'e>) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM jobs WHERE status = 'queued' AND kind = ANY($1)")
+        .bind(GITHUB_KINDS.map(String::from).to_vec())
+        .fetch_one(ex)
+        .await
+}
 
 pub async fn enqueue_webhook<'e>(
     ex: impl PgExecutor<'e>,

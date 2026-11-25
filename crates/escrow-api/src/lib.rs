@@ -21,7 +21,7 @@ use axum::{
     http::{HeaderName, HeaderValue, Method, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use error::ApiError;
 use extract::ClientIp;
@@ -35,11 +35,16 @@ const GLOBAL_PER_MINUTE: u32 = 300;
 const BODY_LIMIT: usize = 1 << 20;
 const WEBHOOK_BODY_LIMIT: usize = 10 << 20;
 
-fn client_ip(req: &Request, trust_proxy: bool) -> String {
-    if trust_proxy && let Some(first) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next())
+fn client_ip(req: &Request, trust_proxy: bool, trust_proxy_hops: usize) -> String {
+    if trust_proxy
+        && let Some(idx) = trust_proxy_hops.checked_sub(1)
+        && let Some(ip) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').map(str::trim).filter(|s| !s.is_empty()).nth(idx))
     {
-        let ip = first.trim();
-        if !ip.is_empty() && ip.len() <= 45 {
+        if ip.len() <= 45 {
             return ip.to_string();
         }
     }
@@ -48,7 +53,7 @@ fn client_ip(req: &Request, trust_proxy: bool) -> String {
 
 /// Resolves the caller's address, counts the request, and applies the per-address ceiling (health checks are exempt).
 async fn edge(axum::extract::State(s): axum::extract::State<AppState>, mut req: Request, next: Next) -> Response {
-    let ip = client_ip(&req, s.cfg.trust_proxy);
+    let ip = client_ip(&req, s.cfg.trust_proxy, s.cfg.trust_proxy_hops);
     Metrics::inc(&s.metrics.http_requests);
     if req.uri().path() != "/health"
         && !limiter::check_shared(&s.db.pool, &s.limiter, &format!("g:{ip}"), GLOBAL_PER_MINUTE, Instant::now()).await
@@ -102,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/payouts", get(admin::list_payouts))
         .route("/admin/payouts/{id}/retry", post(admin::retry_payout))
         .route("/admin/status", get(admin::status))
+        .route("/admin/repos/{id}/ai-reviews", put(admin::set_ai_reviews))
         .route("/github/webhooks", post(webhook::receive).layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT)))
         .fallback(|| async { ApiError::not_found("route") })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -136,4 +142,51 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_ip;
+    use axum::{body::Body, extract::ConnectInfo, http::Request};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn req_with_xff(xff: Option<&str>, peer: Option<IpAddr>) -> Request {
+        let mut b = Request::builder().uri("/bounties");
+        if let Some(v) = xff {
+            b = b.header("x-forwarded-for", v);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        if let Some(ip) = peer {
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::new(ip, 12345)));
+        }
+        req
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_when_untrusted() {
+        let peer = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let req = req_with_xff(Some("10.0.0.1, 203.0.113.9"), Some(peer));
+        assert_eq!(client_ip(&req, false, 1), "192.0.2.10");
+    }
+
+    #[test]
+    fn client_ip_takes_rightmost_proxy_observed_entry_with_spoofed_prefix() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let req = req_with_xff(Some("1.2.3.4, 203.0.113.9"), Some(peer));
+        assert_eq!(client_ip(&req, true, 1), "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_skips_configured_trusted_proxy_hops() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let req = req_with_xff(Some("1.2.3.4, 203.0.113.9, 198.51.100.2"), Some(peer));
+        assert_eq!(client_ip(&req, true, 2), "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_falls_back_when_fewer_entries_than_hops() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+        let req = req_with_xff(Some("203.0.113.9"), Some(peer));
+        assert_eq!(client_ip(&req, true, 2), "10.0.0.3");
+    }
 }

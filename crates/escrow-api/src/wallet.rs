@@ -6,8 +6,9 @@ use crate::error::{ApiError, ApiResult};
 use chrono::{DateTime, Duration, Utc};
 use escrow_chain::keys;
 use escrow_core::security::{random_hex, wallet_challenge_message};
-use escrow_db::{Db, is_unique_violation, new_id, sessions, users};
+use escrow_db::{Db, User, audit, is_unique_violation, new_id, sessions, users};
 use serde::Serialize;
+use serde_json::{Value, json};
 
 const TTL: Duration = Duration::minutes(5);
 
@@ -39,10 +40,10 @@ pub async fn create_challenge(db: &Db, user_id: &str, address: &str, now: DateTi
 }
 
 /// Verifies the signature, burns the challenge (single use) and links the wallet. Returns the address.
-pub async fn verify_challenge(db: &Db, user_id: &str, challenge_id: &str, signature_b64: &str, now: DateTime<Utc>) -> ApiResult<String> {
+pub async fn verify_challenge(db: &Db, user: &User, challenge_id: &str, signature_b64: &str, now: DateTime<Utc>) -> ApiResult<String> {
     let c = sessions::get_challenge(&db.pool, challenge_id)
         .await?
-        .filter(|c| c.user_id == user_id)
+        .filter(|c| c.user_id == user.id)
         .ok_or_else(|| ApiError::new(404, "challenge_not_found", "challenge not found"))?;
     if c.used_at.is_some() {
         return Err(ApiError::conflict("challenge_used", "challenge already used"));
@@ -58,15 +59,37 @@ pub async fn verify_challenge(db: &Db, user_id: &str, challenge_id: &str, signat
     if !sessions::burn_challenge(&mut *tx, &c.id, now).await? {
         return Err(ApiError::conflict("challenge_used", "challenge already used"));
     }
-    match users::set_wallet(&mut *tx, user_id, &c.address, now).await {
+    match users::set_wallet(&mut *tx, &user.id, &c.address, now).await {
         Ok(()) => {}
         Err(e) if is_unique_violation(&e) => return Err(ApiError::conflict("address_taken", "address already linked to another account")),
         Err(e) => return Err(e.into()),
     }
+    // bounties this account funded straight on chain had no maintainer GitHub id; now that the wallet is
+    // linked we can attribute them, so the maintainer can open disputes and their own PRs are filtered out
+    users::backfill_maintainer_github_id(&mut *tx, &user.id).await?;
+    audit::log(
+        &mut *tx,
+        &format!("user:{}", user.github_id),
+        "wallet.linked",
+        &format!("user:{}", user.id),
+        &json!({ "oldAddress": user.wallet.clone(), "newAddress": c.address.clone() }),
+    )
+    .await?;
     tx.commit().await?;
     Ok(c.address)
 }
 
-pub async fn unlink(db: &Db, user_id: &str) -> Result<(), sqlx::Error> {
-    users::clear_wallet(&db.pool, user_id).await
+pub async fn unlink(db: &Db, user: &User) -> ApiResult<()> {
+    let mut tx = db.pool.begin().await?;
+    users::clear_wallet(&mut *tx, &user.id).await?;
+    audit::log(
+        &mut *tx,
+        &format!("user:{}", user.github_id),
+        "wallet.unlinked",
+        &format!("user:{}", user.id),
+        &json!({ "oldAddress": user.wallet.clone(), "newAddress": Value::Null }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }

@@ -37,7 +37,7 @@ impl OAuthClient {
 
     pub fn with_bases(client_id: &str, client_secret: &str, web_base: &str, api_base: &str) -> Self {
         let http =
-            reqwest::Client::builder().timeout(Duration::from_secs(15)).user_agent("skillescrow-backend").build().expect("client builds");
+            reqwest::Client::builder().timeout(Duration::from_secs(15)).user_agent(escrow_core::USER_AGENT).build().expect("client builds");
         Self {
             http,
             client_id: client_id.into(),

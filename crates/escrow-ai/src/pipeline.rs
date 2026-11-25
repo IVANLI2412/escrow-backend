@@ -6,8 +6,8 @@ use crate::{
     schema::{Flag, Verdict},
 };
 use chrono::{DateTime, Duration, Utc};
-use escrow_db::{Db, bounties, prs, reviews};
-use escrow_github::{CiConclusion, GithubApi, GithubError};
+use escrow_db::{Db, bounties, github, models::Bounty, prs, reviews};
+use escrow_github::{CiConclusion, GithubApi, GithubError, Issue};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -33,6 +33,8 @@ pub enum ReviewOutcome {
     RateLimited,
     NoBounty,
     NoPr,
+    /// the repository has turned AI reviews off
+    OptedOut,
 }
 
 #[derive(Debug, Error)]
@@ -74,7 +76,28 @@ fn ci_rank(c: CiConclusion) -> Ci {
 }
 
 fn verdict_of(s: &str) -> Verdict {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(Verdict::NeedsHuman)
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or_else(|_| {
+        tracing::warn!(verdict = s, "unknown review verdict; treating it as needs_human");
+        Verdict::NeedsHuman
+    })
+}
+
+/// Merges the issues and criteria of every bounty a PR closes into one review input. A single bounty is passed
+/// through unchanged; with several, each issue gets its own section and each criterion names its issue.
+fn combine_bounties(live: &[Bounty], issues: Vec<Issue>) -> (String, String, Vec<String>) {
+    if let ([b], [_]) = (live, issues.as_slice()) {
+        let issue = issues.into_iter().next().expect("one issue");
+        return (issue.title, issue.body.unwrap_or_default(), b.criteria.clone());
+    }
+    let title = issues.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join(" + ");
+    let body = live
+        .iter()
+        .zip(&issues)
+        .map(|(b, i)| format!("### Issue #{}: {}\n\n{}", b.issue_number, i.title, i.body.as_deref().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let criteria = live.iter().flat_map(|b| b.criteria.iter().map(move |c| format!("(#{}) {c}", b.issue_number))).collect();
+    (title, body, criteria)
 }
 
 /// Reads a few repository files for review context beyond the diff. A failed read stops the reading and keeps what
@@ -99,18 +122,24 @@ async fn gather_context(d: &ReviewDeps, inst: i64, name: &str, head: &str, chang
     out
 }
 
-/// Reviews one PR against the first live bounty it closes. Reviews are cached per commit, capped per PR and per
-/// repository per day (cost control), and a re-review edits the earlier comment instead of adding another.
+/// Reviews one PR against every live bounty it closes. When a PR closes several bounties, their criteria are
+/// combined into one review (one model call, one comment), and the review counts once per bounty against the
+/// daily caps since it covers that much more work. Reviews are cached per commit, capped per PR and per repository
+/// per day (cost control), and a re-review edits the earlier comment instead of adding another.
 pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force: bool) -> Result<ReviewOutcome, ReviewError> {
     let pool = &d.db.pool;
     let Some(pr) = prs::get(pool, pr_id).await? else {
         return Ok(ReviewOutcome::NoPr);
     };
-    let Some(bounty) = prs::live_bounties(pool, pr_id).await?.into_iter().next() else {
+    let live_bounties = prs::live_bounties(pool, pr_id).await?;
+    let Some(bounty) = live_bounties.first() else {
         return Ok(ReviewOutcome::NoBounty);
     };
     let (_, repo) = bounties::with_repo(pool, bounty.id).await?.ok_or(sqlx::Error::RowNotFound)?;
     let (inst, name) = (repo.installation_id, repo.full_name.as_str());
+    if !github::ai_reviews_enabled(pool, repo.id).await? {
+        return Ok(ReviewOutcome::OptedOut);
+    }
 
     let live = d.gh.get_pull(inst, name, pr.number).await?;
     if live.state != "open" {
@@ -124,20 +153,22 @@ pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force
     if !force && reviews::get(pool, pr_id, &sha).await?.is_some() {
         return Ok(ReviewOutcome::Cached);
     }
+    // a combined review costs one unit per bounty it covers
+    let cost = live_bounties.len() as i64;
     let since = now - Duration::days(1);
-    if reviews::count_for_pr_since(pool, pr_id, since).await? >= d.max_per_pr_per_day
-        || reviews::count_for_repo_since(pool, bounty.repo_id, since).await? >= d.max_per_repo_per_day
+    if reviews::count_for_pr_since(pool, pr_id, since).await? + cost > d.max_per_pr_per_day
+        || reviews::count_for_repo_since(pool, bounty.repo_id, since).await? + cost > d.max_per_repo_per_day
     {
         tracing::info!(pr = pr_id, "review skipped: daily cap");
         return Ok(ReviewOutcome::RateLimited);
     }
 
-    let (issue, files, ci) = tokio::join!(
-        d.gh.get_issue(inst, name, bounty.issue_number),
-        d.gh.get_pull_files(inst, name, pr.number),
-        d.gh.get_ci_conclusion(inst, name, &sha),
-    );
-    let (issue, files) = (issue?, files?);
+    let (files, ci) = tokio::join!(d.gh.get_pull_files(inst, name, pr.number), d.gh.get_ci_conclusion(inst, name, &sha));
+    let files = files?;
+    let mut issues = Vec::with_capacity(live_bounties.len());
+    for b in &live_bounties {
+        issues.push(d.gh.get_issue(inst, name, b.issue_number).await?);
+    }
     let ci = ci.unwrap_or(CiConclusion::None);
     let changes: Vec<FileChange> = files
         .into_iter()
@@ -148,17 +179,23 @@ pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force
     // signals computed by code, not by the model
     let hash = diff_hash(&changes);
     let mut extra = vec![];
-    if !changes.is_empty() && prs::has_duplicate_diff(pool, pr_id, bounty.id, &hash).await? {
-        extra.push(Flag::PossibleDuplicate);
+    if !changes.is_empty() {
+        for b in &live_bounties {
+            if prs::has_duplicate_diff(pool, pr_id, b.id, &hash).await? {
+                extra.push(Flag::PossibleDuplicate);
+                break;
+            }
+        }
     }
     if ci == CiConclusion::Failure {
         extra.push(Flag::CiFailing);
     }
 
+    let (issue_title, issue_body, criteria) = combine_bounties(&live_bounties, issues);
     let input = ReviewInput {
-        issue_title: issue.title,
-        issue_body: issue.body.unwrap_or_default(),
-        criteria: bounty.criteria.clone(),
+        issue_title,
+        issue_body,
+        criteria,
         pr_title: live.title.clone(),
         pr_body: live.body.clone().unwrap_or_default(),
         files: changes,
@@ -220,4 +257,16 @@ pub async fn run_pr_review(d: &ReviewDeps, now: DateTime<Utc>, pr_id: i64, force
         }
     }
     Ok(ReviewOutcome::Reviewed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_verdicts_parse_and_unknown_ones_fall_back_to_needs_human() {
+        assert_eq!(verdict_of("likely_meets"), Verdict::LikelyMeets);
+        assert_eq!(verdict_of("does_not_meet"), Verdict::DoesNotMeet);
+        assert_eq!(verdict_of("totally_new_verdict"), Verdict::NeedsHuman);
+    }
 }

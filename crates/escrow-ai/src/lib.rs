@@ -12,7 +12,8 @@
 //! an injection attempt.
 
 pub mod anthropic;
-pub mod budget;
+// `budget` was merged against APIs that do not compile in this tree (see commit 45947e4); excluded so the
+// crate builds. Restore it once its dependencies land.
 pub mod eval;
 pub mod input;
 pub mod pipeline;
@@ -20,6 +21,5 @@ pub mod review;
 pub mod schema;
 
 pub use anthropic::AnthropicModel;
-pub use budget::{BudgetStatus, CostMicroUsd};
 pub use pipeline::{ReviewDeps, ReviewOutcome, run_pr_review};
 pub use review::{ModelError, ModelOutput, ModelPort};

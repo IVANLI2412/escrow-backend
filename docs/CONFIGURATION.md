@@ -26,7 +26,8 @@ Secrets never appear in logs or `Debug` output.
 | `API_PUBLIC_URL` | `http://localhost:3001` | Where browsers and GitHub reach the API. **Must be `https://` in production**: it decides whether cookies are `Secure`, and is the OAuth callback base (`{API_PUBLIC_URL}/auth/callback`). |
 | `WEB_PUBLIC_URL` | `http://localhost:3000` | The web app. The only CORS origin; where sign-in returns to; used in links the bot posts. |
 | `TRUST_PROXY` | off | `1`/`true` only behind a reverse proxy you control: then `X-Forwarded-For` identifies callers for rate limiting. Left off, the header is ignored, so it cannot be used to dodge limits. |
-| `METRICS_TOKEN` | none | When set, `/metrics` needs `Authorization: Bearer <token>`. |
+| `TRUST_PROXY_HOPS` | `1` | Number of trusted proxy hops to skip from the right of `X-Forwarded-For` when `TRUST_PROXY` is enabled (`1` when a single proxy like Caddy sits in front, `2` behind CDN + Caddy, etc.), preventing clients from spoofing the left-most entry. |
+| `METRICS_TOKEN` | none (public) | When set, `/metrics` needs `Authorization: Bearer <token>`. Left unset, `/metrics` is public to anyone who can reach the API and exposes bounty, payout and job counts; `doctor` warns. **Required on mainnet** (start-up error). |
 
 ## Stellar
 
@@ -35,7 +36,7 @@ Secrets never appear in logs or `Debug` output.
 | `STELLAR_NETWORK` | `testnet` | `testnet`, `mainnet` or `local`. Sets the passphrase and explorer defaults. |
 | `STELLAR_RPC_URL` | testnet: `https://soroban-testnet.stellar.org` | **Required on mainnet**: choose a provider on purpose. |
 | `STELLAR_NETWORK_PASSPHRASE` | by network | Override only for `local`/custom networks. |
-| `TOKEN_XLM_CONTRACT_ID`, `TOKEN_USDC_CONTRACT_ID` | empty | The token contracts bounties can be paid in. **Leave one empty to disable that token** (`/bounty … USDC` is then refused with a clear message). On testnet, the native XLM token's contract id is the Stellar Asset Contract for native; USDC needs a verified issuer's contract. |
+| `TOKEN_XLM_CONTRACT_ID`, `TOKEN_USDC_CONTRACT_ID` | empty | The token contracts bounties can be paid in. **Leave one empty to disable that token** (a non-empty value must be a `C…` 56-character contract id, or startup fails) (`/bounty … USDC` is then refused with a clear message). On testnet, the native XLM token's contract id is the Stellar Asset Contract for native; USDC needs a verified issuer's contract. |
 | `TOKEN_MIN_AMOUNT`, `TOKEN_MAX_AMOUNT` | `1`, `500` | Per-bounty limits **in whole tokens**, enforced when parsing `/bounty`. The contract enforces its own (authoritative) limits too. |
 | `MIN_DAYS`, `MAX_DAYS` | `1`, `90` | Allowed bounty duration. |
 | `INDEXER_START_LEDGER` | none | Where a brand-new database starts reading events. Best: the contract's deployment ledger. |
@@ -84,4 +85,4 @@ Needs the GitHub App **and** a key; otherwise reviews are off. It never affects 
 
 ## Mainnet differences, in one place
 
-`STELLAR_NETWORK=mainnet` makes `STELLAR_RPC_URL` mandatory, switches the passphrase and explorer defaults, refuses `RELAYER_SECRET`, and `doctor` fails (not warns) if `API_PUBLIC_URL` is not `https://`.
+`STELLAR_NETWORK=mainnet` makes `STELLAR_RPC_URL` and `METRICS_TOKEN` mandatory, switches the passphrase and explorer defaults, refuses `RELAYER_SECRET`, and `doctor` fails (not warns) if `API_PUBLIC_URL` is not `https://`.

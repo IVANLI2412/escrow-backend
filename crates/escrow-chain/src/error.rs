@@ -91,6 +91,7 @@ mod tests {
     fn classifies_transient_failures() {
         assert!(ChainError::Http("timeout".into()).is_transient());
         assert!(ChainError::Timeout("abc".into()).is_transient());
+        assert!(ChainError::Busy.is_transient());
         assert!(ChainError::Rpc { code: -32603, message: "internal".into() }.is_transient());
         assert!(!ChainError::Rpc { code: -32602, message: "invalid params".into() }.is_transient());
         assert!(!ChainError::Rejected("bad seq".into()).is_transient());

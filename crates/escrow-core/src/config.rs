@@ -92,6 +92,8 @@ pub struct Config {
     pub review_debounce_secs: u64,
     /// believe `X-Forwarded-For` (only when behind a reverse proxy you control)
     pub trust_proxy: bool,
+    /// number of trusted proxy hops to skip from the right of `X-Forwarded-For` (default 1)
+    pub trust_proxy_hops: usize,
     /// when set, `/metrics` requires `Authorization: Bearer <token>`
     pub metrics_token: Option<String>,
     pub indexer_start_ledger: Option<u32>,
@@ -224,6 +226,14 @@ impl Config {
             r.errors.push("BOUNTY_CONTRACT_ID: must be a Soroban contract id (C…, 56 characters)".into());
         }
 
+        let token_usdc = r.string("TOKEN_USDC_CONTRACT_ID", "");
+        let token_xlm = r.string("TOKEN_XLM_CONTRACT_ID", "");
+        for (name, id) in [("TOKEN_USDC_CONTRACT_ID", &token_usdc), ("TOKEN_XLM_CONTRACT_ID", &token_xlm)] {
+            if !id.is_empty() && !strkey_c.is_match(id) {
+                r.errors.push(format!("{name}: must be a Soroban contract id (C…, 56 characters)"));
+            }
+        }
+
         let app_id = r.matches("GITHUB_APP_ID", &digits, "must be numeric");
         let slug = r.optional("GITHUB_APP_SLUG");
         let key = r.optional("GITHUB_APP_PRIVATE_KEY");
@@ -304,7 +314,18 @@ impl Config {
 
         let admin_github_ids = r
             .matches("ADMIN_GITHUB_IDS", &digits_list, "comma-separated numeric GitHub ids")
-            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .map(|v| {
+                let ids: Result<Vec<i64>, _> = v.split(',')
+                    .map(|x| x.parse::<i64>().map_err(|_| format!("ADMIN_GITHUB_IDS: '{}' overflows i64", x)))
+                    .collect();
+                match ids {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        r.errors.push(e);
+                        vec![]
+                    }
+                }
+            })
             .unwrap_or_default();
         let anthropic_api_key = r.optional("ANTHROPIC_API_KEY");
         if anthropic_api_key.as_deref().is_some_and(|k| k.len() < 10) {
@@ -346,8 +367,39 @@ impl Config {
             r.errors.push("AI_PRICE_INPUT_PER_MTOK and AI_PRICE_OUTPUT_PER_MTOK: must be positive".into());
         }
 
+        let log_level = r.string("LOG_LEVEL", "info");
+        // Validate LOG_LEVEL against common directives. Full validation happens at runtime in init_logging.
+        let is_valid_level = |s: &str| {
+            const LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace", "off"];
+            // Simple level, e.g. "info", "debug"
+            if LEVELS.contains(&s) {
+                return true;
+            }
+            // Module-level directive, e.g. "escrow_engine=debug,info"
+            s.split(',').all(|part| {
+                let part = part.trim();
+                if LEVELS.contains(&part) {
+                    return true;
+                }
+                // module=level format
+                if let Some((_module, level)) = part.split_once('=') {
+                    LEVELS.contains(&level.trim())
+                } else {
+                    false
+                }
+            })
+        };
+        if !log_level.is_empty() && !is_valid_level(&log_level) {
+            r.errors.push(format!("LOG_LEVEL: '{}' is not a valid log level (use error, warn, info, debug, trace, or module=level)", log_level));
+        }
+
+        let metrics_token = r.optional("METRICS_TOKEN");
+        if network == Network::Mainnet && metrics_token.is_none() {
+            r.errors.push("METRICS_TOKEN: required on mainnet (/metrics would be public)".into());
+        }
+
         let cfg = Config {
-            log_level: r.string("LOG_LEVEL", "info"),
+            log_level,
             port: r.number("PORT", 3001u16),
             database_url: r.required("DATABASE_URL"),
             network,
@@ -376,8 +428,8 @@ impl Config {
             relayer_channel_secrets,
             relayer_min_xlm_alert: r.number("RELAYER_MIN_XLM_ALERT", 50.0f64),
             alert_webhook_url: r.optional("ALERT_WEBHOOK_URL"),
-            token_usdc: r.string("TOKEN_USDC_CONTRACT_ID", ""),
-            token_xlm: r.string("TOKEN_XLM_CONTRACT_ID", ""),
+            token_usdc,
+            token_xlm,
             token_min,
             token_max,
             min_days,
@@ -386,7 +438,14 @@ impl Config {
             indexer_lookback_ledgers: r.number("INDEXER_LOOKBACK_LEDGERS", 1000u32),
             review_debounce_secs: r.number("REVIEW_DEBOUNCE_SECS", 300u64),
             trust_proxy: matches!(r.raw("TRUST_PROXY"), Some("1" | "true")),
-            metrics_token: r.optional("METRICS_TOKEN"),
+            trust_proxy_hops: {
+                let hops = r.number("TRUST_PROXY_HOPS", 1usize);
+                if hops == 0 {
+                    r.errors.push("TRUST_PROXY_HOPS: must be at least 1".into());
+                }
+                hops
+            },
+            metrics_token,
             indexer_start_ledger: r.raw("INDEXER_START_LEDGER").and_then(|v| v.parse().ok()),
             db_max_connections: r.number("DB_MAX_CONNECTIONS", 10u32),
             worker_concurrency: r.number("WORKER_CONCURRENCY", 4usize),
@@ -486,21 +545,64 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_makes_you_choose_an_rpc_provider() {
+    fn mainnet_makes_you_choose_an_rpc_provider_and_protect_metrics() {
         let e = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet")])).unwrap_err().to_string();
         assert!(e.contains("STELLAR_RPC_URL: required"), "{e}");
-        let c = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet"), ("STELLAR_RPC_URL", "https://rpc.example/")])).unwrap();
+        assert!(e.contains("METRICS_TOKEN: required"), "{e}");
+        let c = Config::from_map(&with(&[
+            ("STELLAR_NETWORK", "mainnet"),
+            ("STELLAR_RPC_URL", "https://rpc.example/"),
+            ("METRICS_TOKEN", "metrics-secret"),
+        ]))
+        .unwrap();
         assert_eq!(c.rpc_url, "https://rpc.example");
+        assert_eq!(c.metrics_token.as_deref(), Some("metrics-secret"));
         assert_eq!(c.network_passphrase, "Public Global Stellar Network ; September 2015");
         assert!(c.explorer_tx_template.contains("/explorer/public/"));
+    }
+
+    #[test]
+    fn token_contract_ids_are_validated_when_set() {
+        let defaults = Config::from_map(&base()).unwrap();
+        assert!(defaults.token_usdc.is_empty() && defaults.token_xlm.is_empty());
+
+        let ok = Config::from_map(&with(&[("TOKEN_USDC_CONTRACT_ID", CONTRACT), ("TOKEN_XLM_CONTRACT_ID", CONTRACT)])).unwrap();
+        assert_eq!((ok.token_usdc.as_str(), ok.token_xlm.as_str()), (CONTRACT, CONTRACT));
+
+        let e = Config::from_map(&with(&[("TOKEN_USDC_CONTRACT_ID", "CXLMXLMX")])).unwrap_err().to_string();
+        assert!(e.contains("TOKEN_USDC_CONTRACT_ID") && !e.contains("TOKEN_XLM_CONTRACT_ID"));
+    }
+
+    #[test]
+    fn token_id_errors_are_reported_with_the_others() {
+        let e =
+            Config::from_map(&with(&[("TOKEN_USDC_CONTRACT_ID", "bad"), ("TOKEN_XLM_CONTRACT_ID", "G123"), ("STELLAR_NETWORK", "nope")]))
+                .unwrap_err()
+                .to_string();
+        for key in ["TOKEN_USDC_CONTRACT_ID", "TOKEN_XLM_CONTRACT_ID", "STELLAR_NETWORK"] {
+            assert!(e.contains(key), "{key} missing from: {e}");
+        }
     }
 
     #[test]
     fn relayer_secret_is_refused_on_mainnet() {
         let sk = format!("S{}", "A".repeat(55));
         assert!(Config::from_map(&with(&[("RELAYER_SECRET", &sk)])).is_ok());
-        let e = Config::from_map(&with(&[("RELAYER_SECRET", &sk), ("STELLAR_NETWORK", "mainnet")])).unwrap_err().to_string();
+        let e = Config::from_map(&with(&[("RELAYER_SECRET", &sk), ("STELLAR_NETWORK", "mainnet"), ("METRICS_TOKEN", "metrics-secret")]))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("must not be used on mainnet"));
+    }
+
+    #[test]
+    fn metrics_token_is_optional_off_mainnet() {
+        let c = Config::from_map(&base()).unwrap();
+        assert_eq!(c.metrics_token, None);
+        assert!(Config::from_map(&with(&[("METRICS_TOKEN", "metrics-secret")])).unwrap().metrics_token.is_some());
+        let e = Config::from_map(&with(&[("STELLAR_NETWORK", "mainnet"), ("STELLAR_RPC_URL", "https://rpc.example/")]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("METRICS_TOKEN"), "{e}");
     }
 
     #[test]
@@ -545,12 +647,12 @@ mod tests {
     #[test]
     fn helpers() {
         let c = Config::from_map(&with(&[
-            ("TOKEN_XLM_CONTRACT_ID", "CXLMXLMX"),
+            ("TOKEN_XLM_CONTRACT_ID", CONTRACT),
             ("ADMIN_GITHUB_IDS", "7,9"),
             ("API_PUBLIC_URL", "https://api.example/"),
         ]))
         .unwrap();
-        assert_eq!(c.symbol_for("CXLMXLMX"), "XLM");
+        assert_eq!(c.symbol_for(CONTRACT), "XLM");
         assert_eq!(c.symbol_for("CABCDEF"), "CABC…");
         assert!(c.is_admin(9) && !c.is_admin(8));
         assert!(c.secure_cookies());
@@ -586,5 +688,21 @@ mod tests {
     fn ai_pricing_must_be_positive() {
         let e = Config::from_map(&with(&[("AI_PRICE_INPUT_PER_MTOK", "0")])).unwrap_err().to_string();
         assert!(e.contains("must be positive"));
+    }
+
+    #[test]
+    fn admin_github_ids_above_i64_max_are_rejected() {
+        let overflow = format!("{}", (i64::MAX as u128) + 1);
+        let e = Config::from_map(&with(&[("ADMIN_GITHUB_IDS", &overflow)])).unwrap_err().to_string();
+        assert!(e.contains("ADMIN_GITHUB_IDS") && e.contains("overflows i64"), "error was: {e}");
+    }
+
+    #[test]
+    fn log_level_is_validated() {
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "info")])).is_ok());
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "debug")])).is_ok());
+        assert!(Config::from_map(&with(&[("LOG_LEVEL", "escrow_engine=debug")])).is_ok());
+        let e = Config::from_map(&with(&[("LOG_LEVEL", "verbose")])).unwrap_err().to_string();
+        assert!(e.contains("LOG_LEVEL") && e.contains("not a valid log level"), "error was: {e}");
     }
 }

@@ -36,7 +36,11 @@ enum Cmd {
     /// Apply database migrations and exit
     Migrate,
     /// Check configuration and dependencies; exits non-zero on a hard failure
-    Doctor,
+    Doctor {
+        /// Output check results as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Reconcile GitHub App installations and repositories now
     SyncInstallations,
     /// Re-read contract events from a ledger and apply them (safe to repeat)
@@ -51,27 +55,32 @@ enum Cmd {
     Healthcheck,
 }
 
-fn init_logging() {
+fn init_logging(to_stderr: bool) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into())))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let b = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
-    if std::env::var("LOG_FORMAT").is_ok_and(|f| f == "json") {
-        b.json().init();
+    let json_logs = std::env::var("LOG_FORMAT").is_ok_and(|f| f == "json");
+    if to_stderr {
+        let b = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr);
+        if json_logs { b.json().init() } else { b.init() }
     } else {
-        b.init();
+        let b = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+        if json_logs { b.json().init() } else { b.init() }
     }
 }
 
-fn load_env_file() {
-    match std::env::var("ENV_FILE") {
-        Ok(f) => {
-            let _ = dotenvy::from_filename(f);
+/// Loads `ENV_FILE` when it is set, failing if it cannot be read, so a typo in the path never starts the service
+/// on the bare process environment. Without `ENV_FILE`, a `.env` in the working directory is optional.
+fn load_env_file(explicit: Option<&str>) -> Result<()> {
+    match explicit {
+        Some(f) => {
+            dotenvy::from_filename(f).with_context(|| format!("could not load ENV_FILE {f}"))?;
         }
-        Err(_) => {
+        None => {
             let _ = dotenvy::dotenv();
         }
     }
+    Ok(())
 }
 
 fn auto_migrate() -> bool {
@@ -80,18 +89,18 @@ fn auto_migrate() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    load_env_file();
+    load_env_file(std::env::var("ENV_FILE").ok().as_deref())?;
     let cli = Cli::parse();
     if matches!(cli.cmd, Cmd::Healthcheck) {
         return healthcheck();
     }
-    init_logging();
+    init_logging(matches!(cli.cmd, Cmd::Doctor { json: true }));
     // fail fast with every problem listed, before touching the network
     let cfg = Config::from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     match cli.cmd {
         Cmd::Healthcheck => unreachable!("handled before the configuration is loaded"),
-        Cmd::Doctor => doctor::run(cfg).await,
+        Cmd::Doctor { json } => doctor::run(cfg, json).await,
         Cmd::Migrate => {
             runtime::connect(cfg, true).await?;
             println!("migrations applied");
@@ -125,10 +134,7 @@ async fn main() -> Result<()> {
 /// A dependency-free HTTP probe: the runtime image has no curl. Reads PORT from the environment like the server does.
 fn healthcheck() -> Result<()> {
     use std::{net::SocketAddr, time::Duration};
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3001".into())
-        .parse()
-        .context("invalid PORT")?;
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3001".into()).parse().context("invalid PORT")?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     healthcheck_with_timeouts(addr, Duration::from_secs(3), Duration::from_secs(3), Duration::from_secs(5))
 }
@@ -143,12 +149,11 @@ fn healthcheck_with_timeouts(
         io::{Read, Write},
         net::TcpStream,
     };
-    let mut s = TcpStream::connect_timeout(&addr, connect_timeout)
-        .with_context(|| format!("connect failed: could not connect to {addr}"))?;
+    let mut s =
+        TcpStream::connect_timeout(&addr, connect_timeout).with_context(|| format!("connect failed: could not connect to {addr}"))?;
     s.set_write_timeout(Some(write_timeout)).context("set write timeout failed")?;
     s.set_read_timeout(Some(read_timeout)).context("set read timeout failed")?;
-    s.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        .context("write failed: could not send /health request")?;
+    s.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n").context("write failed: could not send /health request")?;
     let mut out = String::new();
     s.read_to_string(&mut out).context("read failed: could not read /health response")?;
     if out.starts_with("HTTP/1.0 200") || out.starts_with("HTTP/1.1 200") {
@@ -160,6 +165,27 @@ fn healthcheck_with_timeouts(
 
 #[cfg(test)]
 mod tests {
+    use super::load_env_file;
+
+    #[test]
+    fn an_explicit_env_file_that_is_missing_aborts_with_its_path() {
+        let err = load_env_file(Some("/nonexistent/escrow/prod.env")).unwrap_err();
+        assert!(format!("{err:#}").contains("/nonexistent/escrow/prod.env"), "{err:#}");
+    }
+
+    #[test]
+    fn an_explicit_env_file_that_exists_is_loaded() {
+        let path = std::env::temp_dir().join(format!("escrowd-env-{}.env", std::process::id()));
+        std::fs::write(&path, "ESCROWD_ENV_FILE_TEST=loaded\n").unwrap();
+        load_env_file(Some(path.to_str().unwrap())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(std::env::var("ESCROWD_ENV_FILE_TEST").as_deref(), Ok("loaded"));
+    }
+
+    #[test]
+    fn the_default_env_file_stays_optional() {
+        load_env_file(None).unwrap();
+    }
     use super::*;
     use std::{
         io::{Read, Write},
@@ -194,7 +220,8 @@ mod tests {
 
         // Refused port reports connect failure
         let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let err = healthcheck_with_timeouts(closed, Duration::from_millis(200), Duration::from_secs(1), Duration::from_secs(1)).unwrap_err();
+        let err =
+            healthcheck_with_timeouts(closed, Duration::from_millis(200), Duration::from_secs(1), Duration::from_secs(1)).unwrap_err();
         assert!(format!("{err:#}").contains("connect failed"), "{err:#}");
 
         // Silent peer reports read failure

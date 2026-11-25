@@ -2,6 +2,7 @@
 //! (needs DATABASE_URL pointing at a server where the role may CREATE DATABASE).
 
 use chrono::{Duration, Utc};
+use escrow_core::PayoutStatus;
 use escrow_db::{Db, MIGRATOR, audit, bounties, disputes, github, intents, jobs, payouts, prs, reviews, sessions, users, webhooks};
 use sqlx::PgPool;
 
@@ -67,6 +68,44 @@ async fn a_wallet_can_belong_to_only_one_account(pool: PgPool) {
     assert_eq!(users::by_wallet(&pool, "GWALLET").await.unwrap().unwrap().id, a.id);
     users::clear_wallet(&pool, &a.id).await.unwrap();
     users::set_wallet(&pool, &b.id, "GWALLET", Utc::now()).await.unwrap();
+}
+
+// #218: linking a wallet backfills the maintainer_github_id on bounties that were funded on chain with no
+// funding link (maintainer_github_id NULL). Bounties that already have one are left untouched.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn linking_a_wallet_backfills_bounties_that_had_no_maintainer_github_id(pool: PgPool) {
+    seed_repo(&pool).await;
+    bounties::insert(
+        &pool,
+        &bounties::NewBounty {
+            id: 4,
+            repo_id: 10,
+            issue_number: 3,
+            issue_url: "https://github.com/acme/widgets/issues/3",
+            maintainer: "GWALLET",
+            maintainer_github_id: None,
+            token: "CTOKEN",
+            amount: 50_000_000,
+            fee_bps: 300,
+            deadline: base() + Duration::days(14),
+            relayer_allowed: true,
+            fund_tx: "fundtx",
+            created_at: Utc::now(),
+            last_event_id: "0000000000000004-0000000001",
+        },
+    )
+    .await
+    .unwrap();
+    // a bounty that already has a maintainer_github_id must not be rewritten
+    bounty(&pool, 5, 4, 50_000_000, 14).await;
+
+    let u = users::upsert_github(&pool, 700, "maintainer", None, false).await.unwrap();
+    users::set_wallet(&pool, &u.id, "GWALLET", Utc::now()).await.unwrap();
+    let filled = users::backfill_maintainer_github_id(&pool, &u.id).await.unwrap();
+    assert_eq!(filled, 1, "only the orphaned bounty is backfilled");
+
+    assert_eq!(bounties::get(&pool, 4).await.unwrap().unwrap().maintainer_github_id, Some(700));
+    assert_eq!(bounties::get(&pool, 5).await.unwrap().unwrap().maintainer_github_id, Some(500), "an existing id is kept");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -249,14 +288,14 @@ async fn payout_transitions_are_guarded(pool: PgPool) {
     let mut tasks = vec![];
     for _ in 0..8 {
         let (pool, id) = (pool.clone(), p.id.clone());
-        tasks.push(tokio::spawn(async move { payouts::release_from_pending(&pool, &id, "QUEUED", "GWIN").await.unwrap() }));
+        tasks.push(tokio::spawn(async move { payouts::release_from_pending(&pool, &id, PayoutStatus::Queued, "GWIN").await.unwrap() }));
     }
     let mut wins = 0;
     for t in tasks {
         wins += usize::from(t.await.unwrap());
     }
     assert_eq!(wins, 1, "exactly one caller moves it out of PENDING_WALLET");
-    assert!(!payouts::release_from_pending(&pool, &p.id, "AWAITING_MAINTAINER", "GOTHER").await.unwrap());
+    assert!(!payouts::release_from_pending(&pool, &p.id, PayoutStatus::AwaitingMaintainer, "GOTHER").await.unwrap());
 
     payouts::mark_submitted(&pool, &p.id, "hash1").await.unwrap();
     let s = payouts::get(&pool, &p.id).await.unwrap().unwrap();
@@ -292,12 +331,12 @@ async fn earnings_join_the_bounty_facts(pool: PgPool) {
     bounty(&pool, 4, 3, 50_000_000, 14).await;
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
     payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
-    let all = payouts::earnings(&pool, 900, false).await.unwrap();
+    let all = payouts::earnings(&pool, 900, false, None, 20).await.unwrap();
     let j = serde_json::to_value(&all[0]).unwrap();
     assert_eq!(j["bounty"]["amount"], "50000000");
     assert_eq!(j["bounty"]["feeBps"], 300);
     assert_eq!(j["status"], "CONFIRMED");
-    assert_eq!(payouts::earnings(&pool, 901, false).await.unwrap().len(), 0);
+    assert_eq!(payouts::earnings(&pool, 901, false, None, 20).await.unwrap().len(), 0);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

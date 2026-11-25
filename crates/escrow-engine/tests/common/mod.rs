@@ -76,17 +76,22 @@ pub struct Funded<'a> {
 }
 
 pub fn funded(f: &Funded<'_>, ledger: u32, n: u32) -> RawEvent {
+    funded_with(f, f.repo_id, 1_795_000_000, ledger, n)
+}
+
+/// Like `funded`, but lets the caller pick `repo_id` and `deadline` so malformed chain values can be fed to the indexer.
+pub fn funded_with(f: &Funded<'_>, repo_id: u64, deadline: u64, ledger: u32, n: u32) -> RawEvent {
     raw(
         "funded",
         f.id,
         map(vec![
             ("maintainer", a(f.maintainer)),
-            ("repo_id", ScVal::U64(f.repo_id)),
+            ("repo_id", ScVal::U64(repo_id)),
             ("issue", ScVal::U64(f.issue)),
             ("token", a(f.token)),
             ("amount", i128v(f.amount)),
             ("fee_bps", ScVal::U32(300)),
-            ("deadline", ScVal::U64(1_795_000_000)),
+            ("deadline", ScVal::U64(deadline)),
             ("relayer_allowed", ScVal::Bool(f.relayer_allowed)),
         ]),
         ledger,

@@ -18,12 +18,10 @@ pub mod jobs;
 pub mod ops;
 pub mod ports;
 pub mod pulls;
-pub mod reconcile;
-pub mod solvency;
+// `reconcile` and `solvency` were merged against a ChainReader/Db API that does not exist in this tree
+// and do not compile; they are excluded here so the crate builds. Restore them once that API lands.
 pub mod sync;
 pub mod webhook_guard;
 pub mod worker;
 
 pub use error::EngineError;
-pub use reconcile::{detect_event_gap, reconcile_bounties};
-pub use solvency::{check_token_solvency, SolvencyCheck, SolvencySeverity};

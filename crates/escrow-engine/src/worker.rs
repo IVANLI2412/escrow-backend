@@ -10,6 +10,7 @@ use crate::{
     jobs as kinds,
     ops::{AlertInputs, AlertSender, collect_alerts},
     ports::ReviewRunner,
+    pulls::recover_missed_merges,
     sync::{GithubCommenter, SyncDeps, announce_payout, refresh_bounty_card, send_refund_reminders},
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -19,6 +20,10 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 const LEASE_SECS: i64 = 180;
+/// How often open linked PRs are re-checked on GitHub for a merge whose webhook was missed.
+const MERGE_RECOVERY_EVERY: Duration = Duration::from_secs(10 * 60);
+/// PRs asked about per pass, so recovery never eats much of an installation's GitHub budget.
+const MERGE_RECOVERY_BATCH: i64 = 25;
 
 pub struct WorkerDeps {
     pub db: Db,
@@ -28,6 +33,8 @@ pub struct WorkerDeps {
     pub chain: Arc<dyn ChainReader>,
     pub relayer: Option<Arc<dyn ReleaseSigner>>,
     pub alerts: Arc<AlertSender>,
+    /// False when the GitHub App is not configured: GitHub jobs then stay queued instead of retrying until they die.
+    pub github_configured: bool,
     pub min_relayer_xlm: f64,
     pub grace: ChronoDuration,
 }
@@ -85,6 +92,14 @@ pub async fn run_queue(w: Arc<WorkerDeps>, stop: CancellationToken, concurrency:
     if w.reviews.is_some() {
         kinds_to_run.push(kinds::REVIEW);
     }
+    if !w.github_configured {
+        kinds_to_run.retain(|k| !kinds::GITHUB_KINDS.contains(k));
+        tracing::warn!("GitHub App is not configured: jobs that need it stay queued until it is");
+    }
+    if kinds_to_run.is_empty() {
+        stop.cancelled().await;
+        return;
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for n in 0..concurrency.max(1) {
         let (w, stop, kinds_to_run) = (w.clone(), stop.clone(), kinds_to_run.clone());
@@ -135,18 +150,32 @@ async fn run_one(w: &WorkerDeps, job: &Job, worker: usize) {
     }
 }
 
-/// Hourly reminders, per-minute alerts, daily housekeeping.
+/// Hourly reminders, per-minute alerts, missed-merge recovery every ten minutes, daily housekeeping.
 pub async fn run_periodic(w: Arc<WorkerDeps>, stop: CancellationToken) {
     let mut reminders = tokio::time::interval(Duration::from_secs(3600));
     let mut alerts = tokio::time::interval(Duration::from_secs(60));
+    let mut merges = tokio::time::interval(MERGE_RECOVERY_EVERY);
     let mut housekeeping = tokio::time::interval(Duration::from_secs(6 * 3600));
+    // where the merge recovery walk continues: each pass checks the next batch, wrapping around at the end
+    let mut merges_after: Option<i64> = None;
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
+            _ = merges.tick(), if w.github_configured => {
+                match recover_missed_merges(&w.dispatch.pulls, w.sync.gh.as_ref(), merges_after, MERGE_RECOVERY_BATCH).await {
+                    Ok(sweep) => {
+                        if !sweep.merged.is_empty() {
+                            tracing::info!(prs = ?sweep.merged, "recovered missed merges");
+                        }
+                        merges_after = sweep.next_after;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "merge recovery skipped"),
+                }
+            }
             _ = reminders.tick() => {
                 let commenter = GithubCommenter { db: w.db.clone(), gh: w.sync.gh.clone() };
                 match send_refund_reminders(&w.db, &commenter, w.grace, &w.sync.web_url, Utc::now()).await {
-                    Ok(s) if !s.is_empty() => tracing::info!(sent = ?s, "refund reminders"),
+                    Ok(r) if !r.is_empty() => tracing::info!(sent = ?r.sent, failed = ?r.failed, "refund reminders"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "reminders skipped"),
                 }

@@ -1,12 +1,21 @@
 # syntax=docker/dockerfile:1
 # Build: docker build -t skillescrow-backend .
-FROM rust:1-bookworm AS build
+FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /src
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
 # aws-lc-rs (the JWT crypto backend) compiles a little C; the full image already has the toolchain.
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --release --locked --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
     cargo build --release --locked -p escrowd && cp target/release/escrowd /escrowd
 
 FROM debian:bookworm-slim

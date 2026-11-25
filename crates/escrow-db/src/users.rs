@@ -58,6 +58,21 @@ pub async fn set_wallet<'e>(ex: impl PgExecutor<'e>, id: &str, address: &str, at
         .map(|_| ())
 }
 
+/// Bounties this account funded straight on chain (no funding link named them) can now be attributed:
+/// once their maintainer wallet is linked to an account, fill in that account's GitHub id. No-op for
+/// bounties that already have a maintainer_github_id (from a funding link). Returns the rows changed.
+pub async fn backfill_maintainer_github_id<'e>(ex: impl PgExecutor<'e>, user_id: &str) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "UPDATE bounties b SET maintainer_github_id = u.github_id, updated_at = now()
+         FROM users u
+         WHERE u.id = $1 AND b.maintainer = u.wallet AND b.maintainer_github_id IS NULL",
+    )
+    .bind(user_id)
+    .execute(ex)
+    .await
+    .map(|r| r.rows_affected())
+}
+
 pub async fn clear_wallet<'e>(ex: impl PgExecutor<'e>, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET wallet = NULL, wallet_linked_at = NULL, updated_at = now() WHERE id = $1")
         .bind(id)

@@ -5,6 +5,7 @@ The backend has to **stay awake**: the worker runs the indexer, the relayer loop
 - [What you need](#what-you-need)
 - [Free and always on: an Oracle Cloud VM + Vercel](#free-and-always-on-an-oracle-cloud-vm--vercel)
 - [Any other server](#any-other-server)
+- [Resource limits and log rotation](#resource-limits-and-log-rotation)
 - [Without Docker](#without-docker)
 - [Pointing the pieces at each other](#pointing-the-pieces-at-each-other)
 - [Updating](#updating)
@@ -75,6 +76,33 @@ Caddy obtains the TLS certificate automatically on first request to `https://$AP
 The same `docker compose` flow works on any Linux host with Docker (a small VPS from any provider). Hosted platforms that run a container and a managed Postgres also work (Fly.io, Railway, a managed Kubernetes): run **one** instance of `escrowd all`, or one `escrowd serve` plus exactly one `escrowd worker`; give it `DATABASE_URL`; expose `PORT`; put it behind HTTPS and set `TRUST_PROXY=1`. They are cheap but not free, and are the right choice when you outgrow one VM.
 
 If you scale the API (`escrowd serve` ×N) that is fine: sessions, deliveries and jobs live in Postgres. Run **one** worker that holds `RELAYER_SECRET` (the relayer assumes a single signing account); additional workers without the secret can still process the job queue.
+
+## Resource limits and log rotation
+
+`docker-compose.yml` sets both log rotation and memory limits on every service so a small single-host VM cannot fill its disk or let a runaway container OOM-kill Postgres:
+
+| Service | Default `mem_limit` | Log rotation (`json-file`) |
+|---|---|---|
+| `db` | `512m` | `max-size: 10m`, `max-file: 3` (≤ 30 MB) |
+| `app` | `256m` | `max-size: 10m`, `max-file: 3` (≤ 30 MB) |
+| `caddy` | `128m` | `max-size: 10m`, `max-file: 3` (≤ 30 MB) |
+
+To adjust these on a larger host without creating merge conflicts on `git pull`, create a `docker-compose.override.yml` alongside `docker-compose.yml` (Docker Compose merges it automatically):
+
+```yaml
+services:
+  db:
+    mem_limit: 2g
+  app:
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+```
+
+Apply changes with `docker compose up -d`.
 
 ## Without Docker
 

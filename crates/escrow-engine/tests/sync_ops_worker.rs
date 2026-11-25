@@ -9,7 +9,7 @@ use escrow_db::{MIGRATOR, audit, bounties, disputes, jobs, payouts, prs, webhook
 use escrow_engine::{
     indexer::CURSOR_ID,
     jobs as kinds,
-    ops::{AlertInputs, AlertSender, collect_alerts, health_report},
+    ops::{Alert, AlertInputs, AlertSender, collect_alerts, health_report},
     ports::{ReviewFailure, ReviewRunner},
     sync::{
         CardOutcome, GithubCommenter, GithubNotifier, IssueCommenter, announce_payout, refresh_bounty_card, send_refund_reminders,
@@ -181,10 +181,10 @@ async fn refund_reminders_go_out_once_each_at_the_right_time(pool: PgPool) {
 
     assert!(send(Utc::now()).await.unwrap().is_empty(), "weeks before the window: silent");
     let soon = deadline + grace - Duration::hours(47);
-    assert_eq!(send(soon).await.unwrap(), ["soon:4"]);
+    assert_eq!(send(soon).await.unwrap().sent, ["soon:4"]);
     assert!(send(soon + Duration::minutes(5)).await.unwrap().is_empty(), "not twice");
     let open = deadline + grace + Duration::minutes(1);
-    assert_eq!(send(open).await.unwrap(), ["open:4"]);
+    assert_eq!(send(open).await.unwrap().sent, ["open:4"]);
     assert!(send(open + Duration::hours(5)).await.unwrap().is_empty());
     let b = w.gh.bodies();
     assert!(b[0].contains("opens in under 48 hours") && b[1].contains("is now open"));
@@ -210,9 +210,35 @@ async fn a_reminder_whose_comment_failed_is_retried_not_forgotten(pool: PgPool) 
     let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
     let c = FlakyCommenter(Mutex::new(0));
     let at = deadline + Duration::hours(72) + Duration::minutes(1);
-    assert!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.is_err());
+    let first = send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap();
+    assert!(first.sent.is_empty());
+    assert_eq!(first.failed, ["open:4"], "a failed comment is reported, not raised");
     assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap(), "only marked sent after the comment succeeded");
-    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap(), ["open:4"]);
+    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap().sent, ["open:4"]);
+}
+
+/// Fails for one bounty, as when its repository's installation was revoked.
+struct FailsFor(i64);
+#[async_trait]
+impl IssueCommenter for FailsFor {
+    async fn comment(&self, bounty_id: i64, _body: &str) -> Result<(), escrow_engine::EngineError> {
+        if bounty_id == self.0 { Err(GithubError::Status { status: 404, what: "installation revoked".into() }.into()) } else { Ok(()) }
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn one_failing_reminder_does_not_stop_the_other_bounties(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    open_bounty(&w, 5, 6).await;
+    let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
+    let at = deadline + Duration::hours(72) + Duration::minutes(1);
+
+    let report = send_refund_reminders(&w.db, &FailsFor(4), Duration::hours(72), "w", at).await.unwrap();
+    assert_eq!(report.sent, ["open:5"]);
+    assert_eq!(report.failed, ["open:4"]);
+    assert!(audit::exists(&pool, "reminder.refund_open", "bounty:5").await.unwrap());
+    assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap());
 }
 
 // ---------------- installations backfill ----------------
@@ -302,7 +328,7 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
     )
     .await
     .unwrap();
-    let text = all.join("\n");
+    let text = all.iter().map(|a| a.text.as_str()).collect::<Vec<_>>().join("\n");
     for needle in [
         "Relayer balance low: 3.00 XLM",
         "1 payout(s) FAILED",
@@ -319,11 +345,26 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
 async fn an_alert_is_sent_once_per_cooldown() {
     let s = AlertSender::new(None, std::time::Duration::from_secs(3600));
     let t0 = Instant::now();
-    let msgs = vec!["relayer low".to_string(), "payout failed".to_string()];
+    let msgs = vec![Alert::new("relayer", "relayer low"), Alert::new("payouts", "payout failed")];
     assert_eq!(s.send(&msgs, t0).await.len(), 2);
     assert!(s.send(&msgs, t0 + std::time::Duration::from_secs(60)).await.is_empty(), "no spam");
-    assert_eq!(s.send(&["new problem".to_string()], t0 + std::time::Duration::from_secs(61)).await, ["new problem"]);
+    assert_eq!(s.send(&[Alert::new("new", "new problem")], t0 + std::time::Duration::from_secs(61)).await, ["new problem"]);
     assert_eq!(s.send(&msgs, t0 + std::time::Duration::from_secs(3601)).await.len(), 2, "reminded after the cooldown");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_growing_indexer_lag_is_sent_once_per_cooldown(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    webhooks::save_cursor(&pool, CURSOR_ID, "c", 9_000).await.unwrap();
+    let s = AlertSender::new(None, std::time::Duration::from_secs(3600));
+    let t0 = Instant::now();
+    let mut delivered = vec![];
+    for (mins, tip) in [(0u64, 9_075u32), (1, 9_090), (10, 9_200), (59, 9_900), (60, 9_960)] {
+        let inputs = AlertInputs { relayer_balance_xlm: None, min_relayer_xlm: 50.0, latest_ledger: Some(tip), now: Utc::now() };
+        let alerts = collect_alerts(&w.db, &inputs).await.unwrap();
+        delivered.extend(s.send(&alerts, t0 + std::time::Duration::from_secs(mins * 60)).await);
+    }
+    assert_eq!(delivered, ["Indexer is 75 ledgers behind", "Indexer is 960 ledgers behind"]);
 }
 
 // ---------------- the worker ----------------
@@ -349,6 +390,7 @@ fn worker(w: &World, reviews: Option<Arc<dyn ReviewRunner>>) -> Arc<WorkerDeps> 
         chain: w.chain.clone(),
         relayer: None,
         alerts: Arc::new(AlertSender::new(None, std::time::Duration::from_secs(60))),
+        github_configured: true,
         min_relayer_xlm: 50.0,
         grace: Duration::hours(72),
     })
@@ -366,6 +408,23 @@ async fn until<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) 
 
 async fn status_of(pool: &PgPool, kind: &str) -> Vec<String> {
     sqlx::query_scalar("SELECT status FROM jobs WHERE kind = $1 ORDER BY id").bind(kind).fetch_all(pool).await.unwrap()
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn without_the_github_app_jobs_stay_queued_instead_of_retrying(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    kinds::enqueue_card_refresh(&pool, 4).await.unwrap();
+    kinds::enqueue_payout_announcement(&pool, 4).await.unwrap();
+    let mut deps = worker(&w, None);
+    Arc::get_mut(&mut deps).unwrap().github_configured = false;
+    let stop = CancellationToken::new();
+    let q = tokio::spawn(run_queue(deps, stop.clone(), 2, std::time::Duration::from_millis(10)));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stop.cancel();
+    q.await.unwrap();
+    let rows: Vec<(String, i32)> = sqlx::query_as("SELECT status, attempts FROM jobs ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, [("queued".to_string(), 0), ("queued".to_string(), 0)], "never claimed, so never retried to death");
+    assert_eq!(kinds::count_waiting_for_github(&pool).await.unwrap(), 2);
 }
 
 fn issue_comment_payload(body: &str) -> serde_json::Value {

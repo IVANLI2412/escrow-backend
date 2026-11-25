@@ -1,6 +1,8 @@
 -- Outbound signed webhooks (see escrow-engine/src/webhook_guard.rs for the URL guard).
 -- A subscription's secret is stored as-is, because HMAC signing needs it; it is shown once at creation
 -- and rotated by replacing it. Deliveries are the audit trail: attempts, response code and duration.
+-- NOTE: the inbound GitHub deliveries live in `webhook_deliveries` (0001); the outbound ones are named
+-- `webhook_subscription_deliveries` here to avoid clashing with that table.
 CREATE TABLE webhook_subscriptions (
   id          TEXT PRIMARY KEY,
   url         TEXT NOT NULL,
@@ -11,7 +13,7 @@ CREATE TABLE webhook_subscriptions (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE webhook_deliveries (
+CREATE TABLE webhook_subscription_deliveries (
   id              BIGSERIAL PRIMARY KEY,
   subscription_id TEXT NOT NULL REFERENCES webhook_subscriptions (id) ON DELETE CASCADE,
   event_id        TEXT NOT NULL,
@@ -28,4 +30,4 @@ CREATE TABLE webhook_deliveries (
   UNIQUE (subscription_id, event_id)
 );
 
-CREATE INDEX webhook_deliveries_due ON webhook_deliveries (run_at) WHERE status = 'queued';
+CREATE INDEX webhook_subscription_deliveries_due ON webhook_subscription_deliveries (run_at) WHERE status = 'queued';

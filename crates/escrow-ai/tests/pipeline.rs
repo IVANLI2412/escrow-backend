@@ -15,6 +15,7 @@ struct Model {
     answers: Mutex<Vec<Result<Value, ModelError>>>,
     calls: Mutex<usize>,
     default: Mutex<Option<Value>>,
+    prompt: Mutex<String>,
 }
 
 impl Model {
@@ -27,12 +28,16 @@ impl Model {
     fn calls(&self) -> usize {
         *self.calls.lock().unwrap()
     }
+    fn last_prompt(&self) -> String {
+        self.prompt.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl ModelPort for Model {
-    async fn complete(&self, _s: &str, _u: &str) -> Result<ModelOutput, ModelError> {
+    async fn complete(&self, _s: &str, u: &str) -> Result<ModelOutput, ModelError> {
         *self.calls.lock().unwrap() += 1;
+        *self.prompt.lock().unwrap() = u.to_string();
         let next = {
             let mut a = self.answers.lock().unwrap();
             if a.is_empty() { None } else { Some(a.remove(0)) }
@@ -207,7 +212,15 @@ async fn env_with_second_pr(pool: &PgPool) -> Env {
     gh.set_pull(seed::REPO, 8, "zzz1234", "t", "b", false, "open", Utc::now());
     gh.set_files(seed::REPO, 8, files());
     Env {
-        d: ReviewDeps { db, gh: gh.clone(), model: model.clone(), model_name: "m".into(), max_per_pr_per_day: 5, max_per_repo_per_day: 50, repo_context: false },
+        d: ReviewDeps {
+            db,
+            gh: gh.clone(),
+            model: model.clone(),
+            model_name: "m".into(),
+            max_per_pr_per_day: 5,
+            max_per_repo_per_day: 50,
+            repo_context: false,
+        },
         gh,
         model,
         pool: pool.clone(),
@@ -284,5 +297,43 @@ async fn a_github_outage_while_reading_the_pr_is_transient(pool: PgPool) {
     open_pr(&e, 100, 7, "abc1234", files()).await;
     e.gh.with(|s| s.fail_next = Some(escrow_github::GithubError::Status { status: 503, what: "x".into() }));
     assert!(run_pr_review(&e.d, Utc::now(), 100, false).await.unwrap_err().is_transient());
+    assert_eq!(e.model.calls(), 0);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn an_opted_out_repository_is_not_reviewed(pool: PgPool) {
+    let e = env(pool.clone()).await;
+    open_pr(&e, 100, 7, "abc1234", files()).await;
+    escrow_db::github::set_ai_reviews(&pool, seed::REPO_ID, false).await.unwrap();
+    assert_eq!(run_pr_review(&e.d, Utc::now(), 100, true).await.unwrap(), ReviewOutcome::OptedOut);
+    assert_eq!(e.model.calls(), 0);
+    assert!(e.gh.comments().is_empty());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_pr_closing_two_bounties_is_reviewed_against_both_in_one_review(pool: PgPool) {
+    let e = env(pool.clone()).await;
+    seed::bounty(&e.d.db, &seed::B::new(5, 9)).await;
+    e.gh.set_issue(seed::REPO, 9, "Log slow queries", "## Acceptance criteria\n- [ ] Logs queries over 1s");
+    open_pr(&e, 100, 7, "abc1234", files()).await;
+    prs::link(&e.pool, 100, 5).await.unwrap();
+
+    assert_eq!(run_pr_review(&e.d, Utc::now(), 100, false).await.unwrap(), ReviewOutcome::Reviewed);
+    assert_eq!(e.model.calls(), 1, "one combined review");
+    let prompt = e.model.last_prompt();
+    assert!(prompt.contains("Retry failed HTTP requests") && prompt.contains("Log slow queries"), "both issues are in the review");
+    assert_eq!(e.gh.comments().len(), 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_combined_review_counts_once_per_bounty_against_the_daily_cap(pool: PgPool) {
+    let mut e = env(pool.clone()).await;
+    e.d.max_per_pr_per_day = 1;
+    seed::bounty(&e.d.db, &seed::B::new(5, 9)).await;
+    e.gh.set_issue(seed::REPO, 9, "Log slow queries", "## Acceptance criteria\n- [ ] Logs queries over 1s");
+    open_pr(&e, 100, 7, "abc1234", files()).await;
+    prs::link(&e.pool, 100, 5).await.unwrap();
+
+    assert_eq!(run_pr_review(&e.d, Utc::now(), 100, false).await.unwrap(), ReviewOutcome::RateLimited);
     assert_eq!(e.model.calls(), 0);
 }

@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use escrow_chain::{ChainBounty, ChainError, ChainReader, ContractConfig, EventSource, EventsPage, FundParams, RawEvent, TxBuilder};
+use escrow_chain::{
+    BuiltTx, ChainBounty, ChainError, ChainReader, ContractConfig, EventSource, EventsPage, FundParams, RawEvent, TxBuilder,
+};
 use escrow_core::BountyStatus;
 use std::{collections::HashMap, sync::Mutex};
 
@@ -97,39 +99,45 @@ impl EventSource for FakeEvents {
 }
 
 /// Records what the API asked it to build; returns recognisable fake XDR.
-#[derive(Default)]
 pub struct FakeTxBuilder {
     pub built: Mutex<Vec<String>>,
     pub submitted: Mutex<Vec<(String, Option<String>)>>,
     pub fail_with: Mutex<Option<ChainError>>,
+    pub valid_until: u64,
+}
+
+impl Default for FakeTxBuilder {
+    fn default() -> Self {
+        Self { built: Mutex::default(), submitted: Mutex::default(), fail_with: Mutex::default(), valid_until: 1_900_000_000 }
+    }
 }
 
 impl FakeTxBuilder {
     fn fail(&self) -> Result<(), ChainError> {
         self.fail_with.lock().unwrap().take().map_or(Ok(()), Err)
     }
-    fn record(&self, s: String) -> Result<String, ChainError> {
+    fn record(&self, s: String) -> Result<BuiltTx, ChainError> {
         self.fail()?;
         self.built.lock().unwrap().push(s.clone());
-        Ok(format!("XDR[{s}]"))
+        Ok(BuiltTx { xdr: format!("XDR[{s}]"), valid_until: self.valid_until })
     }
 }
 
 #[async_trait]
 impl TxBuilder for FakeTxBuilder {
-    async fn build_fund(&self, p: &FundParams) -> Result<String, ChainError> {
+    async fn build_fund(&self, p: &FundParams) -> Result<BuiltTx, ChainError> {
         self.record(format!("fund:{}:{}:{}:{}:{}:{}", p.maintainer, p.repo_id, p.issue, p.token, p.amount, p.relayer_allowed))
     }
-    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<String, ChainError> {
+    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<BuiltTx, ChainError> {
         self.record(format!("release:{maintainer}:{bounty_id}:{winner}"))
     }
-    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.record(format!("refund:{maintainer}:{bounty_id}"))
     }
-    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.record(format!("open_dispute:{arbiter}:{bounty_id}"))
     }
-    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<String, ChainError> {
+    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<BuiltTx, ChainError> {
         self.record(format!("resolve:{arbiter}:{bounty_id}:{}:{winner_bps}", winner.unwrap_or("-")))
     }
     async fn submit_signed(&self, xdr: &str, expected_source: Option<&str>) -> Result<String, ChainError> {

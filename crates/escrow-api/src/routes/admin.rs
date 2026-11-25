@@ -7,6 +7,7 @@ use crate::{
     extract::{ApiJson, ClientIp},
     routes::{
         auth::mutation_limit,
+        prepared_tx,
         public::{Detail, detail_of},
     },
     session::{Authed, require_user},
@@ -19,12 +20,11 @@ use axum::{
 };
 use chrono::Duration;
 use escrow_chain::keys;
-use escrow_db::{Dispute, audit, disputes, jobs, payouts, webhooks};
+use escrow_core::PayoutStatus;
+use escrow_db::{Dispute, audit, disputes, github, jobs, payouts, webhooks};
 use escrow_engine::indexer::CURSOR_ID;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-
-const OVERDUE_HOURS: i64 = 36;
 
 async fn admin(s: &AppState, h: &HeaderMap, ip: &ClientIp, mutating: bool) -> ApiResult<Authed> {
     let a = require_user(s, h, mutating).await?;
@@ -32,7 +32,7 @@ async fn admin(s: &AppState, h: &HeaderMap, ip: &ClientIp, mutating: bool) -> Ap
         return Err(ApiError::forbidden("forbidden", "admins only"));
     }
     if mutating {
-        mutation_limit(s, h, ip, 30)?;
+        mutation_limit(s, Some(&a), ip, 30)?;
     }
     Ok(a)
 }
@@ -70,7 +70,7 @@ pub async fn list_disputes(
     let now = (s.now)();
     let mut out = vec![];
     for d in disputes::list_open(&s.db.pool).await? {
-        let overdue = now - d.created_at > Duration::hours(OVERDUE_HOURS);
+        let overdue = now - d.created_at > Duration::hours(escrow_core::DISPUTE_ALERT_HOURS);
         out.push(DisputeView { bounty: detail_of(&s, d.bounty_id).await?, dispute: d, overdue });
     }
     Ok(Json(out))
@@ -99,9 +99,9 @@ pub async fn open_onchain(
     if d.status != "requested" {
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}", d.status)));
     }
-    let xdr = s.txb.build_open_dispute(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0)).await?;
+    let built = s.txb.build_open_dispute(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0)).await?;
     audit_log(&s, &a, "dispute.open_onchain.build", format!("dispute:{}", d.id), json!({ "bounty": d.bounty_id.to_string() })).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -134,10 +134,10 @@ pub async fn resolve_build(
         return Err(ApiError::conflict("wrong_state", &format!("dispute is {}; open it on chain first", d.status)));
     }
     let winner = if b.winner_bps > 0 { b.winner.as_deref() } else { None };
-    let xdr = s.txb.build_resolve(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0), winner, b.winner_bps).await?;
+    let built = s.txb.build_resolve(&b.arbiter_address, u64::try_from(d.bounty_id).unwrap_or(0), winner, b.winner_bps).await?;
     disputes::set_pending_resolution(&s.db.pool, &d.id, &b.note, winner, b.winner_bps).await?;
     audit_log(&s, &a, "dispute.resolve.build", format!("dispute:{}", d.id), json!({ "winner": b.winner, "bps": b.winner_bps })).await?;
-    Ok(Json(json!({ "xdr": xdr })))
+    Ok(Json(prepared_tx(built, None)?))
 }
 
 #[derive(Deserialize)]
@@ -193,10 +193,10 @@ pub async fn list_payouts(
 ) -> ApiResult<Json<PayoutsPage>> {
     admin(&s, &headers, &ip, false).await?;
     let Query(q) = q.map_err(|_| ApiError::bad_request("invalid query"))?;
-    let status = q.status.unwrap_or_else(|| "FAILED".into());
-    if status.parse::<escrow_core::PayoutStatus>().is_err() {
-        return Err(ApiError::bad_request("invalid status"));
-    }
+    let status = match q.status.as_deref() {
+        None => PayoutStatus::Failed,
+        Some(s) => s.parse::<PayoutStatus>().map_err(|_| ApiError::bad_request("invalid status"))?,
+    };
     let bounty_id = match q.bounty_id.as_deref() {
         None => None,
         Some(v) if digits(v, 18) => Some(v.parse::<i64>().map_err(|_| ApiError::bad_request("invalid bountyId"))?),
@@ -207,11 +207,7 @@ pub async fn list_payouts(
     }
     let limit = match q.limit.as_deref() {
         None => 50,
-        Some(l) => l
-            .parse::<i64>()
-            .ok()
-            .filter(|n| (1..=100).contains(n))
-            .ok_or_else(|| ApiError::bad_request("invalid limit"))?,
+        Some(l) => l.parse::<i64>().ok().filter(|n| (1..=100).contains(n)).ok_or_else(|| ApiError::bad_request("invalid limit"))?,
     };
     let filter = payouts::ListFilter { status, bounty_id, cursor: q.cursor, limit };
     let mut rows = payouts::list(&s.db.pool, &filter).await?;
@@ -230,7 +226,7 @@ pub async fn retry_payout(
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = admin(&s, &headers, &ip, true).await?;
     let p = if id_ok(&id) { payouts::get(&s.db.pool, &id).await? } else { None }.ok_or_else(|| ApiError::not_found("payout"))?;
-    if p.status != "FAILED" {
+    if p.status() != PayoutStatus::Failed {
         return Err(ApiError::conflict("wrong_state", &format!("payout is {}", p.status)));
     }
     if p.tx_hash.is_some() {
@@ -243,6 +239,28 @@ pub async fn retry_payout(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+pub struct AiReviewsBody {
+    enabled: bool,
+}
+
+/// Turns AI reviews (automatic and `/bounty review`) on or off for one tracked repository.
+pub async fn set_ai_reviews(
+    State(s): State<AppState>,
+    Extension(ip): Extension<ClientIp>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(b): ApiJson<AiReviewsBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let a = admin(&s, &headers, &ip, true).await?;
+    if github::get_repo(&s.db.pool, id).await?.is_none() {
+        return Err(ApiError::not_found("repo"));
+    }
+    github::set_ai_reviews(&s.db.pool, id, b.enabled).await?;
+    audit_log(&s, &a, "repo.ai_reviews", format!("repo:{id}"), json!({ "enabled": b.enabled })).await?;
+    Ok(Json(json!({ "ok": true, "aiReviews": b.enabled })))
+}
+
 pub async fn status(
     State(s): State<AppState>,
     Extension(ip): Extension<ClientIp>,
@@ -250,12 +268,16 @@ pub async fn status(
 ) -> ApiResult<Json<serde_json::Value>> {
     admin(&s, &headers, &ip, false).await?;
     let cursor = webhooks::get_cursor(&s.db.pool, CURSOR_ID).await?;
+    let anomaly_count = audit::count_anomalies_24h(&s.db.pool).await?;
     Ok(Json(json!({
         "indexerLedger": cursor.as_ref().map(|c| c.ledger), "indexerUpdatedAt": cursor.map(|c| c.updated_at),
-        "failedPayouts": payouts::count_by_status(&s.db.pool, &["FAILED"]).await?,
-        "waitingPayouts": payouts::count_by_status(&s.db.pool, &["PENDING_WALLET", "AWAITING_MAINTAINER"]).await?,
+        "failedPayouts": payouts::count_by_status(&s.db.pool, &[PayoutStatus::Failed]).await?,
+        "waitingPayouts": payouts::count_by_status(&s.db.pool, &[PayoutStatus::PendingWallet, PayoutStatus::AwaitingMaintainer]).await?,
         "openDisputes": disputes::count_open(&s.db.pool).await?,
         "deadJobs": jobs::count_dead(&s.db.pool).await?,
         "pendingJobs": jobs::count_pending(&s.db.pool).await?,
+        // sign-in exists only with the GitHub App; without it, GitHub jobs are not claimed and wait here
+        "waitingForGithub": if s.login.is_some() { 0 } else { escrow_engine::jobs::count_waiting_for_github(&s.db.pool).await? },
+        "anomalies24h": anomaly_count,
     })))
 }
