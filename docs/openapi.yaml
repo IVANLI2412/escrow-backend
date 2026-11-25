@@ -467,6 +467,47 @@ paths:
                   aiReviews: { type: boolean }
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+  /admin/audit:
+    get:
+      tags: [Admin]
+      summary: Browse the audit log (keyset-paginated, newest first)
+      description: |
+        Returns audit-log rows ordered by `(createdAt, id)` descending. Combine
+        `actor`, `action` and `targetPrefix` to scope an investigation; the
+        existing `audit_log_lookup (action, target)` index covers the common
+        filter-by-action browse. Use `cursor` with the previous page's
+        `nextCursor` to walk the log without snapshotting.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: actor, in: query, schema: { type: string, maxLength: 200 } }
+        - { name: action, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: targetPrefix, in: query, description: Match any `target` starting with this string, schema: { type: string, maxLength: 200 } }
+        - { name: cursor, in: query, schema: { type: string, pattern: '^[a-z0-9]{10,40}$' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, nextCursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, actor, action, target, data, createdAt]
+                      properties:
+                        id: { type: string }
+                        actor: { type: string }
+                        action: { type: string }
+                        target: { type: string }
+                        data: { type: object }
+                        createdAt: { type: string, format: date-time }
+                  nextCursor: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /admin/status:
     get:
       tags: [Admin]

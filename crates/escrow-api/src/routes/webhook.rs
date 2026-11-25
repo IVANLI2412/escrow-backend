@@ -10,7 +10,7 @@ use axum::{
 };
 use escrow_core::security::verify_webhook_signature;
 use escrow_db::webhooks;
-use escrow_engine::jobs::enqueue_webhook;
+use escrow_engine::{dispatch::is_handled_webhook_event, jobs::enqueue_webhook};
 use serde_json::json;
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -28,12 +28,23 @@ pub async fn receive(State(s): State<AppState>, headers: HeaderMap, body: Bytes)
         return Err(ApiError::bad_request("missing delivery headers"));
     };
     if id.len() > 100 || event.len() > 60 {
+        // #126 — Over-long headers are a rejection, counted like a bad
+        // signature or missing headers rather than silently falling through.
+        Metrics::inc(&s.metrics.webhooks_rejected);
         return Err(ApiError::bad_request("delivery headers are too long"));
     }
     let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
         Metrics::inc(&s.metrics.webhooks_rejected);
         ApiError::new(400, "bad_json", "invalid JSON")
     })?;
+
+    // #127 — `dispatch_webhook` drops unknown events as `"ignored"`, so storing
+    // and queuing them costs a delivery row and a job for nothing. Acknowledge
+    // the delivery with 202 and count it under `webhooks_ignored` instead.
+    if !is_handled_webhook_event(event) {
+        Metrics::inc(&s.metrics.webhooks_ignored);
+        return Ok((StatusCode::ACCEPTED, Json(json!({ "ignored": true }))).into_response());
+    }
 
     // the delivery record and its job are written together: neither can exist without the other
     let mut tx = s.db.pool.begin().await?;

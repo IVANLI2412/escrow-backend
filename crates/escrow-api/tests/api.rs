@@ -1143,6 +1143,9 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
 
     // the chain emits `disputed`; the indexer would do this:
     disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+    // #134 — resolve/build requires the chain itself to report Disputed; the
+    // indexer would have moved it when it saw the open_dispute event land.
+    e.chain.set_status(4, BountyStatus::Disputed);
     let again = call(
         &e.app,
         Method::POST,
@@ -1222,6 +1225,136 @@ async fn a_dispute_can_be_rejected_with_a_note_once(pool: PgPool) {
 
 async fn get_admin(e: &Env, s: &Session, uri: &str) -> Resp {
     call(&e.app, Method::GET, uri, &s.hdrs(false), None).await
+}
+
+// #134 — building a dispute transaction is refused when the chain's view of
+// the bounty disagrees with what the route needs. The check sits on the
+// shared `require_chain_status` helper rather than being duplicated per route.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn open_onchain_is_refused_when_the_bounty_is_no_longer_open_on_chain(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+    let (_, arbiter) = stellar(9);
+    let d = disputes::create(&pool, 4, 500, "late").await.unwrap();
+    // chain says the bounty was already refunded or released by the maintainer
+    e.chain.set_status(4, BountyStatus::Released);
+
+    let r = call(
+        &e.app,
+        Method::POST,
+        &format!("/admin/disputes/{}/open-onchain", d.id),
+        &admin.hdrs(true),
+        Some(json!({ "arbiterAddress": arbiter })),
+    )
+    .await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("not_open")));
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("RELEASED"));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn resolve_build_is_refused_when_the_bounty_is_not_disputed_on_chain(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+    let (_, arbiter) = stellar(9);
+    let (_, winner) = stellar(10);
+    let d = disputes::create(&pool, 4, 500, "late").await.unwrap();
+    // the DB row looks ready to resolve, but the chain still has it Open
+    disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+
+    let r = call(
+        &e.app,
+        Method::POST,
+        &format!("/admin/disputes/{}/resolve/build", d.id),
+        &admin.hdrs(true),
+        Some(json!({ "arbiterAddress": arbiter, "winner": winner, "winnerBps": 5000 })),
+    )
+    .await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("not_disputed")));
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("OPEN"));
+}
+
+// #133 — The audit log browse endpoint.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn admin_audit_log_browse_supports_filters_and_pagination(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+
+    // Non-admin is forbidden.
+    let plain = signed_in(&e, 2, "u", None, false).await;
+    let forbidden = call(&e.app, Method::GET, "/admin/audit", &plain.hdrs(false), None).await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // Unauthenticated is also rejected.
+    assert_eq!(get(&e, "/admin/audit").await.status, StatusCode::UNAUTHORIZED);
+
+    audit::log(&pool, "admin:1", "payout.retry", "payout:a", &json!({})).await.unwrap();
+    audit::log(&pool, "admin:1", "dispute.rejected", "dispute:b", &json!({})).await.unwrap();
+    audit::log(&pool, "admin:2", "payout.retry", "payout:c", &json!({})).await.unwrap();
+
+    let all = get_admin(&e, &admin, "/admin/audit").await;
+    assert_eq!(all.status, StatusCode::OK);
+    assert_eq!(all.body["items"].as_array().unwrap().len(), 3, "{all:?}");
+    assert_eq!(all.body["items"][0]["target"].as_str(), Some("payout:c"), "newest first");
+
+    let by_actor = get_admin(&e, &admin, "/admin/audit?actor=admin:2").await;
+    assert_eq!(by_actor.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(by_actor.body["items"][0]["actor"].as_str(), Some("admin:2"));
+
+    let by_action = get_admin(&e, &admin, "/admin/audit?action=payout.retry").await;
+    assert_eq!(by_action.body["items"].as_array().unwrap().len(), 2);
+    assert!(by_action.body["items"].as_array().unwrap().iter().all(|r| r["action"] == "payout.retry"));
+
+    let by_prefix = get_admin(&e, &admin, "/admin/audit?targetPrefix=payout:").await;
+    assert_eq!(by_prefix.body["items"].as_array().unwrap().len(), 2);
+
+    let page1 = get_admin(&e, &admin, "/admin/audit?limit=2").await;
+    assert_eq!(page1.body["items"].as_array().unwrap().len(), 2);
+    let cursor = page1.body["nextCursor"].as_str().expect("more rows produce a cursor").to_string();
+    let page2 = get_admin(&e, &admin, &format!("/admin/audit?limit=2&cursor={cursor}")).await;
+    let pg2_items = page2.body["items"].as_array().unwrap();
+    assert_eq!(pg2_items.len(), 1);
+    assert!(page2.body["nextCursor"].is_null(), "last page has no cursor");
+
+    // Query validation rejects bad input instead of running the scan.
+    assert_eq!(get_admin(&e, &admin, "/admin/audit?limit=0").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(get_admin(&e, &admin, "/admin/audit?cursor=BAD!").await.status, StatusCode::BAD_REQUEST);
+}
+
+// #127 — The webhook receiver drops events the backend has no handler for
+// with a 202, counting them but never writing to the queue.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn an_unhandled_webhook_event_is_acknowledged_without_creating_a_job(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = r#"{"action":"created"}"#;
+    // `star` is not in HANDLED_WEBHOOK_EVENTS; it should 202 without queuing.
+    let r = deliver(&e, "star-1", "star", body, Some(sign_body(body))).await;
+    assert_eq!((r.status, r.body["ignored"].clone()), (StatusCode::ACCEPTED, json!(true)));
+    let (deliveries, jobs): (i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries").fetch_one(&pool).await.unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM jobs").fetch_one(&pool).await.unwrap(),
+    );
+    assert_eq!((deliveries, jobs), (0, 0), "unhandled events must not write delivery rows or jobs");
+
+    let m = get(&e, "/metrics").await;
+    assert!(m.text.contains("skillescrow_webhooks_ignored_total 1"), "{}", m.text);
+}
+
+// #126 — Over-long delivery headers are a rejection, counted like any other
+// 4xx on the metrics side so dashboards see them.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn over_long_delivery_headers_are_counted_as_rejected(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = "{}";
+    let long_id = "a".repeat(101);
+    let r = deliver(&e, &long_id, "issue_comment", body, Some(sign_body(body))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let m = get(&e, "/metrics").await;
+    // Both the bad-signature and bad-JSON cases already bump this counter;
+    // the over-long-headers case must now too.
+    assert!(m.text.contains("skillescrow_webhooks_rejected_total 1"), "{}", m.text);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

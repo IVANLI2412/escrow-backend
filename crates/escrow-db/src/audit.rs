@@ -95,6 +95,73 @@ pub async fn recent<'e>(
     .await
 }
 
+/// #133 — Keyset-paginated filter over the audit log.
+///
+/// Rows are ordered newest-first by `(created_at, id)` so the caller can walk
+/// the log without snapshotting or repeating rows on concurrent writes.
+///
+/// `actor` and `action` are exact-match filters; `target_prefix` matches any
+/// `target` starting with the given string (so a caller can scope the browse
+/// to a bounty, dispute, repo or payout). `cursor` is the `id` of the row that
+/// ended the previous page.
+///
+/// The `audit_log_lookup (action, target)` index covers the common
+/// filter-by-action browse. Filters whose action is not fixed fall back to
+/// a sorted scan that is bounded by `limit`.
+pub struct Filter<'a> {
+    pub actor: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub target_prefix: Option<&'a str>,
+    pub cursor: Option<&'a str>,
+    pub limit: i64,
+}
+
+pub async fn list(
+    pool: &sqlx::PgPool,
+    f: &Filter<'_>,
+) -> Result<Vec<crate::models::AuditEntry>, sqlx::Error> {
+    // #133 — The WHERE clauses below mirror the `audit_log_lookup` index on
+    // (action, target); other dimensions are post-filtered inside the index
+    // scan so the plan stays sort-free.
+    let target_pattern =
+        f.target_prefix.map(|p| format!("{}%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+    let (anchor_created_at, anchor_id) = match f.cursor {
+        None => (None, None),
+        Some(id) => {
+            let row: Option<(DateTime<Utc>, String)> =
+                sqlx::query_as("SELECT created_at, id FROM audit_log WHERE id = $1").bind(id).fetch_optional(pool).await?;
+            match row {
+                Some((ts, id)) => (Some(ts), Some(id)),
+                // Cursor row is gone (deleted or never existed). Return an
+                // empty page instead of restarting from the top so the client
+                // cannot accidentally loop over the same rows.
+                None => return Ok(Vec::new()),
+            }
+        }
+    };
+    sqlx::query_as(
+        "SELECT id, actor, action, target, data, created_at
+           FROM audit_log
+          WHERE ($1::text IS NULL OR actor  = $1)
+            AND ($2::text IS NULL OR action = $2)
+            AND ($3::text IS NULL OR target LIKE $3 ESCAPE '\\')
+            AND (
+                  $4::timestamptz IS NULL
+               OR (created_at, id) < ($4, $5::text)
+            )
+          ORDER BY created_at DESC, id DESC
+          LIMIT $6",
+    )
+    .bind(f.actor)
+    .bind(f.action)
+    .bind(target_pattern)
+    .bind(anchor_created_at)
+    .bind(anchor_id)
+    .bind(f.limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Counts `anomaly_detected` audit entries in the last 24 hours.
 pub async fn count_anomalies_24h<'e>(
     ex: impl PgExecutor<'e>,
