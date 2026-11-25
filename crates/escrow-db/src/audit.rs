@@ -1,4 +1,3 @@
-
 // Append-only audit trail. It also serves as the "already sent" memory for
 // reminders and announcements.
 //
@@ -11,6 +10,7 @@
 // storing signed transaction payloads or secrets.
 
 use crate::new_id;
+use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
 
 /// Records an audit event.

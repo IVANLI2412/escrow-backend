@@ -1,5 +1,5 @@
 use crate::{models::Dispute, new_id};
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, PgPool};
 
 const COLS: &str = "id, bounty_id, opened_by_github_id, reason, evidence, status, resolution_note, created_at, updated_at";
 
@@ -12,6 +12,50 @@ pub async fn create<'e>(ex: impl PgExecutor<'e>, bounty_id: i64, opened_by: i64,
     .bind(opened_by)
     .bind(reason)
     .fetch_one(ex)
+    .await
+}
+
+/// What [`create_if_none_open`] did.
+#[derive(Debug, Clone)]
+pub enum NewDispute {
+    /// A new dispute row was inserted.
+    Created(Dispute),
+    /// The bounty already had an open (`requested` or `opened_onchain`) dispute; nothing was written.
+    AlreadyOpen(Dispute),
+}
+
+/// Records a dispute unless the bounty already has an open one. The guard is the partial unique index
+/// `disputes_one_open_per_bounty`, so concurrent requests cannot both insert.
+pub async fn create_if_none_open(pool: &PgPool, bounty_id: i64, opened_by: i64, reason: &str) -> Result<NewDispute, sqlx::Error> {
+    // The open dispute can be resolved between our conflicting insert and the lookup; retry the pair then.
+    for _ in 0..3 {
+        let inserted: Option<Dispute> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO disputes (id, bounty_id, opened_by_github_id, reason, status) VALUES ($1,$2,$3,$4,'requested') \
+             ON CONFLICT (bounty_id) WHERE status IN ('requested','opened_onchain') DO NOTHING RETURNING {COLS}"
+        )))
+        .bind(new_id())
+        .bind(bounty_id)
+        .bind(opened_by)
+        .bind(reason)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(d) = inserted {
+            return Ok(NewDispute::Created(d));
+        }
+        if let Some(d) = open_for_bounty(pool, bounty_id).await? {
+            return Ok(NewDispute::AlreadyOpen(d));
+        }
+    }
+    Err(sqlx::Error::RowNotFound)
+}
+
+/// The bounty's open dispute, if any.
+pub async fn open_for_bounty<'e>(ex: impl PgExecutor<'e>, bounty_id: i64) -> Result<Option<Dispute>, sqlx::Error> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLS} FROM disputes WHERE bounty_id = $1 AND status IN ('requested','opened_onchain')"
+    )))
+    .bind(bounty_id)
+    .fetch_optional(ex)
     .await
 }
 
