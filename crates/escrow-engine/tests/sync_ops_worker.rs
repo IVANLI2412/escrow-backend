@@ -334,7 +334,8 @@ async fn health_is_ok_when_dependencies_answer_and_the_indexer_keeps_up(pool: Pg
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgPool) {
     let w = world(pool.clone()).await;
-    let calm = AlertInputs { relayer_balance_xlm: Some(500.0), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() };
+    let calm =
+        AlertInputs { relayer_balance_xlm: Some(Ok(500.0)), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() };
     assert!(collect_alerts(&w.db, &calm).await.unwrap().is_empty());
 
     open_bounty(&w, 4, 3).await;
@@ -350,7 +351,7 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
 
     let all = collect_alerts(
         &w.db,
-        &AlertInputs { relayer_balance_xlm: Some(3.0), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() },
+        &AlertInputs { relayer_balance_xlm: Some(Ok(3.0)), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() },
     )
     .await
     .unwrap();
@@ -365,6 +366,54 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
     ] {
         assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
     }
+}
+
+/// #108: a failing balance read fires its own alert, so the operator pages when the signer
+/// can't speak to the network (account missing, RPC error) just as if the balance were low.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_failing_balance_read_produces_its_own_alert(pool: PgPool) {
+    let w = world(pool.clone()).await;
+
+    // A reading that succeeded does not surface a read-failed alert, even though the balance is low.
+    let ok = collect_alerts(
+        &w.db,
+        &AlertInputs {
+            relayer_balance_xlm: Some(Ok(1.0)),
+            min_relayer_xlm: 50.0,
+            latest_ledger: Some(10_000),
+            now: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(ok.iter().any(|a| a.key == "relayer_balance"), "low-balance alert still fires when the read succeeded");
+    assert!(ok.iter().all(|a| a.key != "relayer_balance_read_failed"));
+
+    // Simulate the failing signer fake: the real worker builds this from
+    // `ReleaseSigner::balance_xlm().await.map_err(|e| e.to_string())`.
+    let signer_error = ChainError::Simulation("account not found".to_string()).to_string();
+    let alerts = collect_alerts(
+        &w.db,
+        &AlertInputs {
+            relayer_balance_xlm: Some(Err(signer_error.clone())),
+            min_relayer_xlm: 50.0,
+            latest_ledger: Some(10_000),
+            now: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let read_fail = alerts.iter().find(|a| a.key == "relayer_balance_read_failed").expect("read-failed alert present");
+    assert!(read_fail.text.contains("account not found"));
+    // The two alerts are keyed separately so the sender's per-key cooldown does not swallow one when
+    // the operator has already acknowledged the other.
+    assert!(alerts.iter().all(|a| a.key != "relayer_balance"), "a failed read does not also fire low-balance");
+
+    // The AlertSender keys on `key`, so a second poll inside the cooldown is silent (not a storm).
+    let s = AlertSender::new(None, std::time::Duration::from_secs(60));
+    let t0 = Instant::now();
+    assert_eq!(s.send(&alerts, t0).await.len(), alerts.len());
+    assert!(s.send(&alerts, t0 + std::time::Duration::from_secs(10)).await.is_empty());
 }
 
 #[tokio::test]
