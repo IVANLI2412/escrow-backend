@@ -75,6 +75,10 @@ pub enum CardOutcome {
 
 /// Fills the issue title and criteria, posts the card once and edits it in place afterwards, and keeps the
 /// bounty label current. Safe to call repeatedly: every chain event for the bounty calls it.
+///
+/// The database transaction is NOT held across GitHub API calls. Instead we use a short transaction
+/// only to check/set the card comment ID under an advisory lock, then perform the GitHub call,
+/// then a second short transaction to persist the comment ID if it was a new post.
 pub async fn refresh_bounty_card(d: &SyncDeps, bounty_id: i64) -> Result<CardOutcome, EngineError> {
     let Some((b, repo)) = active_repo(&d.db.pool, bounty_id).await? else {
         return Ok(CardOutcome::Skipped);
@@ -108,21 +112,49 @@ pub async fn refresh_bounty_card(d: &SyncDeps, bounty_id: i64) -> Result<CardOut
         web_url: &d.web_url,
     });
 
-    // One refresh at a time per bounty: without the lock two concurrent calls would both post a card.
-    let mut tx = d.db.pool.begin().await?;
-    bounties::lock_card(&mut tx, b.id).await?;
-    let outcome = match bounties::card_comment(&mut *tx, b.id).await? {
+    // Short transaction 1: acquire advisory lock, check if card comment exists.
+    // If it exists, we'll update it. If not, we'll post a new one.
+    let (outcome, existing_cid) = {
+        let mut tx = d.db.pool.begin().await?;
+        bounties::lock_card(&mut tx, b.id).await?;
+        match bounties::card_comment(&mut *tx, b.id).await? {
+            Some(cid) => {
+                tx.commit().await?;
+                (CardOutcome::Updated, Some(cid))
+            }
+            None => {
+                tx.commit().await?;
+                (CardOutcome::Posted, None)
+            }
+        }
+    };
+
+    // GitHub API call OUTSIDE any database transaction.
+    let comment_id = match existing_cid {
         Some(cid) => {
             d.gh.update_comment(inst, name, cid, &body).await?;
-            CardOutcome::Updated
+            cid
         }
         None => {
             let cid = d.gh.post_comment(inst, name, b.issue_number, &body).await?;
-            bounties::set_card_comment(&mut *tx, b.id, cid).await?;
-            CardOutcome::Posted
+
+            // Short transaction 2: persist the comment ID under the lock.
+            // Double-check in case another concurrent refresh already posted.
+            let mut tx = d.db.pool.begin().await?;
+            bounties::lock_card(&mut tx, b.id).await?;
+            if let Some(existing) = bounties::card_comment(&mut *tx, b.id).await? {
+                tx.commit().await?;
+                // Another process already posted; update that comment instead of leaving two.
+                d.gh.update_comment(inst, name, existing, &body).await?;
+                existing
+            } else {
+                bounties::set_card_comment(&mut *tx, b.id, cid).await?;
+                tx.commit().await?;
+                cid
+            }
         }
     };
-    tx.commit().await?;
+    let _ = comment_id; // silences unused warning when tracing is off
 
     if b.status().is_active() {
         d.gh.set_bounty_label(inst, name, b.issue_number, &label_for(b.amount_i128(), &symbol)).await?;
