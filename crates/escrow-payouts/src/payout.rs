@@ -1,6 +1,6 @@
 use crate::ports::{Notifier, PayoutError};
 use escrow_chain::{ChainReader, ReleaseSigner, TxOutcome};
-use escrow_core::BountyStatus;
+use escrow_core::{BountyStatus, PayoutStatus};
 use escrow_db::{Db, payouts, users};
 use std::sync::Arc;
 
@@ -54,6 +54,21 @@ async fn say(d: &PayoutDeps, bounty: i64, pr: i32, msg: &str) {
     }
 }
 
+/// #107: comment the contributor sees on the PR after a FAILED transition. It never names the
+/// internal cause (a `ChainError` may carry the RPC URL in an error_result_xdr tail, a contract
+/// code gives away which guard tripped) and points at the operator path. Posted once per payout:
+/// `payouts::claim_failure_notice` guarantees exactly one claim across concurrent callers.
+const FAILURE_COMMENT: &str =
+    "This payout could not be completed and has been flagged for operator attention. No action is needed from you.";
+
+async fn notify_once_on_fail(d: &PayoutDeps, payout_id: &str, bounty: i64, pr: i32) {
+    match payouts::claim_failure_notice(&d.db.pool, payout_id).await {
+        Ok(true) => say(d, bounty, pr, FAILURE_COMMENT).await,
+        Ok(false) => {}
+        Err(e) => tracing::warn!(payout = %payout_id, error = %e, "claim_failure_notice failed (best effort)"),
+    }
+}
+
 /// A linked PR was merged. First merge wins: one payout per bounty. Re-reads the bounty from the chain first.
 pub async fn on_merge(d: &PayoutDeps, bounty_id: i64, pr_number: i32, author_github_id: i64) -> Result<MergeOutcome, PayoutError> {
     if d.chain.get_bounty(id_u64(bounty_id)).await?.status != BountyStatus::Open {
@@ -72,7 +87,7 @@ pub async fn advance(d: &PayoutDeps, bounty_id: i64) -> Result<Advance, PayoutEr
     let Some(p) = payouts::for_bounty(&d.db.pool, bounty_id).await? else {
         return Ok(Advance::NoPayout);
     };
-    if p.status() != escrow_core::PayoutStatus::PendingWallet {
+    if p.status() != PayoutStatus::PendingWallet {
         return Ok(Advance::AlreadyMoving(p.status));
     }
     let chain = d.chain.get_bounty(id_u64(bounty_id)).await?;
@@ -86,14 +101,15 @@ pub async fn advance(d: &PayoutDeps, bounty_id: i64) -> Result<Advance, PayoutEr
     };
     if wallet == chain.maintainer {
         payouts::mark_failed(&d.db.pool, &p.id, "winner is the maintainer", false).await?;
+        notify_once_on_fail(d, &p.id, bounty_id, p.pr_number).await;
         return Ok(Advance::Failed);
     }
-    let next = if chain.relayer_allowed { "QUEUED" } else { "AWAITING_MAINTAINER" };
+    let next = if chain.relayer_allowed { PayoutStatus::Queued } else { PayoutStatus::AwaitingMaintainer };
     // guarded update: of several concurrent callers exactly one moves it out of PENDING_WALLET
     if !payouts::release_from_pending(&d.db.pool, &p.id, next, &wallet).await? {
         return Ok(Advance::Raced);
     }
-    if next == "AWAITING_MAINTAINER" {
+    if next == PayoutStatus::AwaitingMaintainer {
         say(d, bounty_id, p.pr_number, &format!("The maintainer must release this bounty at {}/b/{bounty_id}.", d.web_url)).await;
         return Ok(Advance::AwaitingMaintainer);
     }
@@ -116,9 +132,9 @@ pub async fn relay_release(d: &PayoutDeps, signer: &dyn ReleaseSigner, bounty_id
     let Some(p) = payouts::for_bounty(pool, bounty_id).await? else {
         return Err(PayoutError::Other(format!("no payout for bounty {bounty_id}")));
     };
-    match p.status.as_str() {
-        "CONFIRMED" => return Ok(RelayResult::Confirmed),
-        "FAILED" => return Ok(RelayResult::Failed),
+    match p.status() {
+        PayoutStatus::Confirmed => return Ok(RelayResult::Confirmed),
+        PayoutStatus::Failed => return Ok(RelayResult::Failed),
         _ => {}
     }
     let Some(winner) = p.winner_address.clone() else {
@@ -126,7 +142,7 @@ pub async fn relay_release(d: &PayoutDeps, signer: &dyn ReleaseSigner, bounty_id
     };
 
     // A hash we already submitted: check it instead of submitting again.
-    if p.status == "SUBMITTED"
+    if p.status() == PayoutStatus::Submitted
         && let Some(hash) = &p.tx_hash
     {
         return settle(d, signer, &p, &winner, hash).await;
@@ -141,12 +157,16 @@ pub async fn relay_release(d: &PayoutDeps, signer: &dyn ReleaseSigner, bounty_id
     if chain.status != BountyStatus::Open || !chain.relayer_allowed {
         let why = format!("bounty is {}, relayerAllowed={}", chain.status, chain.relayer_allowed);
         payouts::mark_failed(pool, &p.id, &why, false).await?;
+        notify_once_on_fail(d, &p.id, bounty_id, p.pr_number).await;
         return Ok(RelayResult::Failed);
     }
 
     let hash = match signer.submit_release(id_u64(bounty_id), &winner).await {
         Ok(h) => h,
-        Err(e) => return fail(d, &p, e.contract_error().is_some(), e.to_string()).await,
+        // #109: a rejected transaction result (TxBadSeq, TxInsufficientFee) should retry; a
+        // contract rejection or a non-retryable Tx result (TxInsufficientBalance, malformed)
+        // is deterministic and must fail immediately.
+        Err(e) => return fail(d, &p, e.is_permanent_rejection(), e.to_string()).await,
     };
     // Record the hash BEFORE waiting, so a crash never leads to a second submission.
     payouts::mark_submitted(pool, &p.id, &hash).await?;
@@ -170,6 +190,7 @@ async fn settle(
         }
         Ok(TxOutcome::Failed) => {
             payouts::mark_failed(pool, &p.id, "transaction failed on chain", false).await?;
+            notify_once_on_fail(d, &p.id, p.bounty_id, p.pr_number).await;
             Ok(RelayResult::Failed)
         }
         Ok(TxOutcome::NotFound) => {
@@ -188,9 +209,13 @@ async fn settle(
                 return Err(PayoutError::Transient("submitted transaction expired; resubmitting".into()));
             }
             payouts::mark_failed(pool, &p.id, &format!("bounty became {} while waiting", chain.status), false).await?;
+            notify_once_on_fail(d, &p.id, p.bounty_id, p.pr_number).await;
             Ok(RelayResult::Failed)
         }
-        Err(e) => fail(d, p, false, e.to_string()).await,
+        // #109: `wait_for_tx` network-level errors are transient; a permanent rejection surfaced
+        // here (contract error on a getTransaction poll is unusual, but is_permanent_rejection
+        // covers it) is deterministic.
+        Err(e) => fail(d, p, e.is_permanent_rejection(), e.to_string()).await,
     }
 }
 
@@ -198,6 +223,7 @@ async fn settle(
 async fn fail(d: &PayoutDeps, p: &escrow_db::Payout, deterministic: bool, msg: String) -> Result<RelayResult, PayoutError> {
     if deterministic || p.attempts + 1 >= MAX_ATTEMPTS {
         payouts::mark_failed(&d.db.pool, &p.id, &msg, true).await?;
+        notify_once_on_fail(d, &p.id, p.bounty_id, p.pr_number).await;
         return Ok(RelayResult::Failed);
     }
     payouts::record_attempt_error(&d.db.pool, &p.id, &msg).await?;

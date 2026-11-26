@@ -2,7 +2,7 @@
 
 use crate::models::{AiReview, Bounty, PullRequest};
 use chrono::{DateTime, Utc};
-use sqlx::PgExecutor;
+use sqlx::{FromRow, PgExecutor};
 
 const COLS: &str = "id, number, author_github_id, author_login, head_sha, state, merged_at, diff_hash";
 
@@ -66,6 +66,25 @@ pub async fn for_bounty<'e>(ex: impl PgExecutor<'e>, bounty_id: i64) -> Result<V
     .bind(bounty_id)
     .fetch_all(ex)
     .await
+}
+
+/// Batch counterpart of `for_bounty`: each PR is paired with the bounty it is linked to.
+pub async fn for_bounties<'e>(ex: impl PgExecutor<'e>, bounty_ids: &[i64]) -> Result<Vec<(i64, PullRequest)>, sqlx::Error> {
+    #[derive(FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        pr: PullRequest,
+        bounty_id: i64,
+    }
+    sqlx::query_as::<_, Row>(
+        "SELECT p.id, p.number, p.author_github_id, p.author_login, p.head_sha, p.state, p.merged_at, p.diff_hash, l.bounty_id
+         FROM pull_requests p JOIN pull_request_bounties l ON l.pr_id = p.id
+         WHERE l.bounty_id = ANY($1) ORDER BY l.bounty_id, p.id",
+    )
+    .bind(bounty_ids)
+    .fetch_all(ex)
+    .await
+    .map(|rows| rows.into_iter().map(|r| (r.bounty_id, r.pr)).collect())
 }
 
 /// Bounties a PR closes that are still live, oldest first.
@@ -168,4 +187,36 @@ pub async fn open_with_latest_review<'e>(
             (r.pr, review)
         })
         .collect())
+}
+
+/// An open PR linked to a live bounty, with where to ask GitHub about it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OpenLinked {
+    pub id: i64,
+    pub number: i32,
+    pub author_github_id: i64,
+    pub author_login: String,
+    pub head_sha: String,
+    pub installation_id: i64,
+    pub repo_full_name: String,
+}
+
+/// Open PRs linked to at least one live (OPEN or DISPUTED) bounty, oldest first (by GitHub id), starting after
+/// `after_id` so successive calls walk the whole set a page at a time. PRs on suspended installations are
+/// skipped: GitHub would refuse the call.
+pub async fn open_linked_to_live<'e>(ex: impl PgExecutor<'e>, after_id: Option<i64>, limit: i64) -> Result<Vec<OpenLinked>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT p.id, p.number, p.author_github_id, p.author_login, p.head_sha, r.installation_id, r.full_name AS repo_full_name
+         FROM pull_requests p
+         JOIN LATERAL (SELECT b.repo_id FROM pull_request_bounties l JOIN bounties b ON b.id = l.bounty_id
+                       WHERE l.pr_id = p.id AND b.status IN ('OPEN','DISPUTED') ORDER BY b.id LIMIT 1) live ON TRUE
+         JOIN repos r ON r.id = live.repo_id
+         JOIN installations i ON i.id = r.installation_id
+         WHERE p.state = 'open' AND i.suspended_at IS NULL AND ($1::bigint IS NULL OR p.id > $1)
+         ORDER BY p.id LIMIT $2",
+    )
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(ex)
+    .await
 }

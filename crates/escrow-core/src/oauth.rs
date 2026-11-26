@@ -182,6 +182,7 @@ mod tests {
         assert!(!session_cookie("id", 60, false).contains("Secure"));
         assert!(session_cookie("id", 60, false).contains("HttpOnly"));
         assert!(clear_cookie("x", false).contains("Max-Age=0"));
-        assert!(clear_cookie("x", true).contains("Secure"));
+        assert!(clear_cookie(SESSION_COOKIE, true).starts_with("se_session=") && clear_cookie(SESSION_COOKIE, true).ends_with("; Secure"));
+        assert!(!clear_cookie(SESSION_COOKIE, false).contains("Secure"));
     }
 }

@@ -35,6 +35,8 @@ pub struct Pull {
     pub state: String,
     #[serde(default)]
     pub merged: bool,
+    #[serde(default)]
+    pub merged_at: Option<DateTime<Utc>>,
     pub head: Head,
     pub user: PullUser,
     pub created_at: DateTime<Utc>,
@@ -90,13 +92,21 @@ pub trait GithubApi: Send + Sync {
     async fn get_issue(&self, installation: i64, repo: &str, issue: i32) -> Result<Issue, GithubError>;
     /// Creates the label if needed and sets it on the issue, replacing earlier `bounty:` labels.
     async fn set_bounty_label(&self, installation: i64, repo: &str, issue: i32, label: &str) -> Result<(), GithubError>;
+    /// Removes any `bounty:` labels from the issue.
+    async fn remove_bounty_label(&self, installation: i64, repo: &str, issue: i32) -> Result<(), GithubError>;
     async fn get_pull(&self, installation: i64, repo: &str, pr: i32) -> Result<Pull, GithubError>;
     async fn get_pull_files(&self, installation: i64, repo: &str, pr: i32) -> Result<Vec<PullFile>, GithubError>;
     async fn get_ci_conclusion(&self, installation: i64, repo: &str, sha: &str) -> Result<CiConclusion, GithubError>;
     async fn get_readme_excerpt(&self, installation: i64, repo: &str, max_chars: usize) -> Result<String, GithubError>;
     /// A file's text at `git_ref` (the default branch when `None`). `None` when the file is absent, binary or too
     /// large. Used for review context. The default reads nothing, so implementors need not change.
-    async fn get_file_at(&self, _installation: i64, _repo: &str, _git_ref: Option<&str>, _path: &str) -> Result<Option<String>, GithubError> {
+    async fn get_file_at(
+        &self,
+        _installation: i64,
+        _repo: &str,
+        _git_ref: Option<&str>,
+        _path: &str,
+    ) -> Result<Option<String>, GithubError> {
         Ok(None)
     }
     /// All installations of this App (authenticated as the App itself).

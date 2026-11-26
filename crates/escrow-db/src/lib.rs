@@ -11,6 +11,7 @@ pub mod disputes;
 pub mod github;
 pub mod intents;
 pub mod jobs;
+pub mod leader;
 pub mod models;
 pub mod payout_reminders;
 pub mod payouts;
@@ -28,7 +29,7 @@ use std::time::Duration;
 
 pub use models::*;
 pub use sqlx::Error as DbError;
-pub use untracked::{get_untracked_for_repo, min_untracked_ledger_for_repo, store_untracked_funded, UntrackedFundedEvent};
+pub use untracked::{UntrackedFundedEvent, get_untracked_for_repo, min_untracked_ledger_for_repo, store_untracked_funded};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 

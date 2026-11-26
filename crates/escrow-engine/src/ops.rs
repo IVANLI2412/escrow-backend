@@ -3,6 +3,7 @@
 use crate::indexer::CURSOR_ID;
 use chrono::{DateTime, Duration, Utc};
 use escrow_chain::ChainReader;
+use escrow_core::PayoutStatus;
 use escrow_db::{Db, audit, disputes, jobs, payouts, webhooks};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -39,7 +40,10 @@ pub async fn health_report(db: &Db, chain: &dyn ChainReader, check_indexer_lag: 
 }
 
 pub struct AlertInputs {
-    pub relayer_balance_xlm: Option<f64>,
+    /// `None` when no relayer is configured; otherwise `Some(Ok(balance))` or `Some(Err(reason))`.
+    /// A failed read is surfaced as its own alert, so the window where the relayer has drained but
+    /// the balance call is also failing (account missing, RPC down) still pages the operator.
+    pub relayer_balance_xlm: Option<Result<f64, String>>,
     pub min_relayer_xlm: f64,
     pub latest_ledger: Option<u32>,
     pub now: DateTime<Utc>,
@@ -61,12 +65,18 @@ impl Alert {
 /// The alerts that apply right now.
 pub async fn collect_alerts(db: &Db, a: &AlertInputs) -> Result<Vec<Alert>, sqlx::Error> {
     let mut out = vec![];
-    if let Some(b) = a.relayer_balance_xlm
-        && b < a.min_relayer_xlm
-    {
-        out.push(Alert::new("relayer_balance", format!("Relayer balance low: {b:.2} XLM (alert below {})", a.min_relayer_xlm)));
+    match &a.relayer_balance_xlm {
+        Some(Ok(b)) if *b < a.min_relayer_xlm => {
+            out.push(Alert::new("relayer_balance", format!("Relayer balance low: {b:.2} XLM (alert below {})", a.min_relayer_xlm)));
+        }
+        Some(Err(reason)) => {
+            // Keyed separately from `relayer_balance` so the cooldown on one does not swallow the
+            // other, and so an operator can tell "balance low" from "balance unreadable" in the log.
+            out.push(Alert::new("relayer_balance_read_failed", format!("Relayer balance could not be read: {reason}")));
+        }
+        _ => {}
     }
-    let failed = payouts::count_by_status(&db.pool, &["FAILED"]).await?;
+    let failed = payouts::count_by_status(&db.pool, &[PayoutStatus::Failed]).await?;
     if failed > 0 {
         out.push(Alert::new("payouts_failed", format!("{failed} payout(s) FAILED and need attention")));
     }
@@ -76,9 +86,9 @@ pub async fn collect_alerts(db: &Db, a: &AlertInputs) -> Result<Vec<Alert>, sqlx
             out.push(Alert::new("indexer_lag", format!("Indexer is {lag} ledgers behind")));
         }
     }
-    let stale = disputes::count_open_older_than(&db.pool, a.now - Duration::hours(36)).await?;
+    let stale = disputes::count_open_older_than(&db.pool, a.now - Duration::hours(escrow_core::DISPUTE_ALERT_HOURS)).await?;
     if stale > 0 {
-        out.push(Alert::new("disputes_stale", format!("{stale} dispute(s) older than 36 h")));
+        out.push(Alert::new("disputes_stale", format!("{stale} dispute(s) older than {} h", escrow_core::DISPUTE_ALERT_HOURS)));
     }
     // merged-but-unpaid PRs whose refund window opens within 72 h: the arbiter may need to act
     let risky: Vec<(i64, String)> = sqlx::query_as(
@@ -142,7 +152,8 @@ impl AlertSender {
     /// Returns the texts actually sent (alerts whose key is not in cooldown).
     pub async fn send(&self, alerts: &[Alert], now: Instant) -> Vec<String> {
         let fresh: Vec<String> = {
-            let mut sent = self.sent.lock().unwrap();
+            // recover a poisoned lock: the map only holds cooldown timestamps, so its contents stay usable
+            let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
             // a key past its cooldown holds nothing back, so dropping it keeps the map as small as the live alerts
             sent.retain(|_, t| now.duration_since(*t) < self.cooldown);
             alerts
@@ -178,5 +189,19 @@ mod tests {
         s.send(&[Alert::new("a", "x"), Alert::new("b", "y")], t0).await;
         s.send(&[Alert::new("c", "z")], t0 + std::time::Duration::from_secs(61)).await;
         assert_eq!(s.sent.lock().unwrap().len(), 1, "only the live key is kept");
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_lock_does_not_panic_later_alerts() {
+        let s = std::sync::Arc::new(AlertSender::new(None, std::time::Duration::from_secs(60)));
+        let s2 = s.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = s2.sent.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(s.sent.is_poisoned());
+        let sent = s.send(&[Alert::new("a", "x")], Instant::now()).await;
+        assert_eq!(sent, vec!["x".to_string()]);
     }
 }

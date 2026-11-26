@@ -53,6 +53,7 @@ pub struct Repo {
     pub installation_id: i64,
     pub full_name: String,
     pub is_private: bool,
+    pub suspended_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -169,6 +170,9 @@ pub struct Payout {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Non-null once the "payout needs attention" PR comment has been posted for this payout
+    /// (#107). Set via `payouts::claim_failure_notice`, which guarantees exactly one claim per row.
+    pub failure_notified_at: Option<DateTime<Utc>>,
 }
 
 impl Payout {
@@ -189,6 +193,12 @@ pub struct Dispute {
     pub evidence: serde_json::Value,
     pub status: String,
     pub resolution_note: Option<String>,
+    #[serde(skip)]
+    pub pending_note: Option<String>,
+    #[serde(skip)]
+    pub pending_winner: Option<String>,
+    #[serde(skip)]
+    pub pending_winner_bps: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

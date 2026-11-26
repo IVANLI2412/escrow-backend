@@ -68,6 +68,45 @@ pub async fn with_repo<'e>(ex: impl PgExecutor<'e> + Copy, id: i64) -> Result<Op
     Ok(Some((b, repo)))
 }
 
+/// Batch counterpart of `with_repo`, for pages that would otherwise query once per bounty.
+pub async fn with_repo_many<'e>(ex: impl PgExecutor<'e>, ids: &[i64]) -> Result<Vec<(Bounty, Repo)>, sqlx::Error> {
+    #[derive(FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        bounty: Bounty,
+        repo_pk: i64,
+        repo_installation_id: i64,
+        repo_full_name: String,
+        repo_is_private: bool,
+        repo_suspended_at: Option<DateTime<Utc>>,
+    }
+    sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
+        "SELECT {}, r.id AS repo_pk, r.installation_id AS repo_installation_id, r.full_name AS repo_full_name, \
+         r.is_private AS repo_is_private, r.suspended_at AS repo_suspended_at
+         FROM bounties b JOIN repos r ON r.id = b.repo_id WHERE b.id = ANY($1) ORDER BY b.id",
+        qualified_cols()
+    )))
+    .bind(ids)
+    .fetch_all(ex)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.bounty,
+                    Repo {
+                        id: r.repo_pk,
+                        installation_id: r.repo_installation_id,
+                        full_name: r.repo_full_name,
+                        is_private: r.repo_is_private,
+                        suspended_at: r.repo_suspended_at,
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
 /// The bounty a new `/bounty` would collide with (Open or Disputed funds are still locked).
 pub async fn find_active_for_issue<'e>(ex: impl PgExecutor<'e>, repo_id: i64, issue_number: i32) -> Result<Option<Bounty>, sqlx::Error> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {BOUNTY_COLS} FROM bounties WHERE repo_id = $1 AND issue_number = $2 AND status IN ('OPEN','DISPUTED') ORDER BY id DESC LIMIT 1")))
@@ -97,11 +136,17 @@ pub async fn active_for_issues<'e>(ex: impl PgExecutor<'e>, repo_id: i64, issues
     .await
 }
 
-pub async fn by_maintainer<'e>(ex: impl PgExecutor<'e>, wallet: &str) -> Result<Vec<Bounty>, sqlx::Error> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {BOUNTY_COLS} FROM bounties WHERE maintainer = $1 ORDER BY id DESC")))
-        .bind(wallet)
-        .fetch_all(ex)
-        .await
+/// Bounties a maintainer funded, newest first: those funded from `wallet` (their current one, if linked) and those
+/// recorded against their GitHub account, so bounties funded from an earlier wallet stay visible. Each bounty
+/// appears once.
+pub async fn by_maintainer<'e>(ex: impl PgExecutor<'e>, wallet: Option<&str>, github_id: i64) -> Result<Vec<Bounty>, sqlx::Error> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {BOUNTY_COLS} FROM bounties WHERE ($1::text IS NOT NULL AND maintainer = $1) OR maintainer_github_id = $2 ORDER BY id DESC"
+    )))
+    .bind(wallet)
+    .bind(github_id)
+    .fetch_all(ex)
+    .await
 }
 
 pub async fn open_ones<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Bounty>, sqlx::Error> {
@@ -244,7 +289,7 @@ impl Default for ListFilter {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RepoName {
     #[serde(rename = "fullName")]
     pub full_name: String,

@@ -12,8 +12,8 @@ use escrow_engine::{
     ops::{Alert, AlertInputs, AlertSender, collect_alerts, health_report},
     ports::{ReviewFailure, ReviewRunner},
     sync::{
-        CardOutcome, GithubCommenter, GithubNotifier, IssueCommenter, announce_payout, refresh_bounty_card, send_refund_reminders,
-        sync_installations,
+        CardOutcome, GithubCommenter, GithubNotifier, IssueCommenter, announce_payout, dispute_comment_body, post_dispute_comment,
+        refresh_bounty_card, send_refund_reminders, sync_installations,
     },
     worker::{WorkerDeps, handle_job, run_queue},
 };
@@ -72,11 +72,29 @@ async fn the_card_reflects_the_new_status_and_drops_the_label_when_the_bounty_cl
     let w = world(pool.clone()).await;
     open_bounty(&w, 4, 3).await;
     refresh_bounty_card(&w.sync(), 4).await.unwrap();
+    assert_eq!(w.gh.with(|s| s.labels.clone()), [(seed::REPO.to_string(), 3, "bounty: 5 XLM".to_string())]);
+
     bounties::apply_released(&pool, 4, "e9", "txhash", "GWIN", None).await.unwrap();
     refresh_bounty_card(&w.sync(), 4).await.unwrap();
     let edited = w.gh.with(|s| s.edits.last().cloned()).unwrap().1;
     assert!(edited.contains("✅ Paid") && !edited.contains("How to claim"));
-    assert_eq!(w.gh.with(|s| s.labels.len()), 1, "no new label for a closed bounty");
+    assert!(w.gh.with(|s| s.labels.is_empty()), "bounty label is dropped once released");
+    assert!(w.gh.calls().contains(&"remove_bounty_label".to_string()));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn the_card_reflects_the_new_status_and_drops_the_label_when_the_bounty_is_refunded(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    refresh_bounty_card(&w.sync(), 4).await.unwrap();
+    assert_eq!(w.gh.with(|s| s.labels.clone()), [(seed::REPO.to_string(), 3, "bounty: 5 XLM".to_string())]);
+
+    bounties::apply_refunded(&pool, 4, "e10", "refund_tx").await.unwrap();
+    refresh_bounty_card(&w.sync(), 4).await.unwrap();
+    let edited = w.gh.with(|s| s.edits.last().cloned()).unwrap().1;
+    assert!(edited.contains("↩️ Refunded") && !edited.contains("How to claim"));
+    assert!(w.gh.with(|s| s.labels.is_empty()), "bounty label is dropped once refunded");
+    assert!(w.gh.calls().contains(&"remove_bounty_label".to_string()));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -147,6 +165,32 @@ async fn a_paid_comment_names_the_contributor_and_links_the_transaction_once(poo
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn dispute_comment_jobs_post_the_outcome_and_the_arbiter_note_once(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    kinds::enqueue_dispute_comment(&pool, 4, "disputed", None, "event-111").await.unwrap();
+    kinds::enqueue_dispute_comment(&pool, 4, "resolved", None, "event-120").await.unwrap();
+    kinds::enqueue_dispute_comment(&pool, 4, "rejected", Some("no merit"), "dispute:xyz").await.unwrap();
+    let stop = CancellationToken::new();
+    let q = tokio::spawn(run_queue(worker(&w, None), stop.clone(), 2, std::time::Duration::from_millis(10)));
+    until(|| async { status_of(&pool, "dispute.comment").await == ["done", "done", "done"] }).await;
+    stop.cancel();
+    q.await.unwrap();
+
+    let comments = w.gh.comments();
+    assert_eq!(comments.len(), 3);
+    assert!(comments.iter().all(|c| c.issue == 3));
+    let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+    assert_eq!(bodies[0], dispute_comment_body("disputed", None));
+    assert_eq!(bodies[1], dispute_comment_body("resolved", None));
+    assert!(bodies[2].contains("no merit"), "{}", bodies[2]);
+
+    // A replay of the same event/decision is a no-op: the audit marker was written after GitHub accepted it.
+    assert!(!post_dispute_comment(&w.sync(), 4, bodies[0], "event-111").await.unwrap());
+    assert_eq!(w.gh.comments().len(), 3);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn without_a_payout_row_the_announcement_goes_on_the_issue_with_a_short_address(pool: PgPool) {
     let w = world(pool.clone()).await;
     open_bounty(&w, 4, 3).await;
@@ -181,10 +225,10 @@ async fn refund_reminders_go_out_once_each_at_the_right_time(pool: PgPool) {
 
     assert!(send(Utc::now()).await.unwrap().is_empty(), "weeks before the window: silent");
     let soon = deadline + grace - Duration::hours(47);
-    assert_eq!(send(soon).await.unwrap(), ["soon:4"]);
+    assert_eq!(send(soon).await.unwrap().sent, ["soon:4"]);
     assert!(send(soon + Duration::minutes(5)).await.unwrap().is_empty(), "not twice");
     let open = deadline + grace + Duration::minutes(1);
-    assert_eq!(send(open).await.unwrap(), ["open:4"]);
+    assert_eq!(send(open).await.unwrap().sent, ["open:4"]);
     assert!(send(open + Duration::hours(5)).await.unwrap().is_empty());
     let b = w.gh.bodies();
     assert!(b[0].contains("opens in under 48 hours") && b[1].contains("is now open"));
@@ -210,9 +254,35 @@ async fn a_reminder_whose_comment_failed_is_retried_not_forgotten(pool: PgPool) 
     let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
     let c = FlakyCommenter(Mutex::new(0));
     let at = deadline + Duration::hours(72) + Duration::minutes(1);
-    assert!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.is_err());
+    let first = send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap();
+    assert!(first.sent.is_empty());
+    assert_eq!(first.failed, ["open:4"], "a failed comment is reported, not raised");
     assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap(), "only marked sent after the comment succeeded");
-    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap(), ["open:4"]);
+    assert_eq!(send_refund_reminders(&w.db, &c, Duration::hours(72), "w", at).await.unwrap().sent, ["open:4"]);
+}
+
+/// Fails for one bounty, as when its repository's installation was revoked.
+struct FailsFor(i64);
+#[async_trait]
+impl IssueCommenter for FailsFor {
+    async fn comment(&self, bounty_id: i64, _body: &str) -> Result<(), escrow_engine::EngineError> {
+        if bounty_id == self.0 { Err(GithubError::Status { status: 404, what: "installation revoked".into() }.into()) } else { Ok(()) }
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn one_failing_reminder_does_not_stop_the_other_bounties(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    open_bounty(&w, 4, 3).await;
+    open_bounty(&w, 5, 6).await;
+    let deadline = bounties::get(&pool, 4).await.unwrap().unwrap().deadline;
+    let at = deadline + Duration::hours(72) + Duration::minutes(1);
+
+    let report = send_refund_reminders(&w.db, &FailsFor(4), Duration::hours(72), "w", at).await.unwrap();
+    assert_eq!(report.sent, ["open:5"]);
+    assert_eq!(report.failed, ["open:4"]);
+    assert!(audit::exists(&pool, "reminder.refund_open", "bounty:5").await.unwrap());
+    assert!(!audit::exists(&pool, "reminder.refund_open", "bounty:4").await.unwrap());
 }
 
 // ---------------- installations backfill ----------------
@@ -282,7 +352,8 @@ async fn health_is_ok_when_dependencies_answer_and_the_indexer_keeps_up(pool: Pg
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgPool) {
     let w = world(pool.clone()).await;
-    let calm = AlertInputs { relayer_balance_xlm: Some(500.0), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() };
+    let calm =
+        AlertInputs { relayer_balance_xlm: Some(Ok(500.0)), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() };
     assert!(collect_alerts(&w.db, &calm).await.unwrap().is_empty());
 
     open_bounty(&w, 4, 3).await;
@@ -298,7 +369,7 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
 
     let all = collect_alerts(
         &w.db,
-        &AlertInputs { relayer_balance_xlm: Some(3.0), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() },
+        &AlertInputs { relayer_balance_xlm: Some(Ok(3.0)), min_relayer_xlm: 50.0, latest_ledger: Some(10_000), now: Utc::now() },
     )
     .await
     .unwrap();
@@ -313,6 +384,54 @@ async fn every_alert_condition_is_reported_and_a_calm_system_is_silent(pool: PgP
     ] {
         assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
     }
+}
+
+/// #108: a failing balance read fires its own alert, so the operator pages when the signer
+/// can't speak to the network (account missing, RPC error) just as if the balance were low.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_failing_balance_read_produces_its_own_alert(pool: PgPool) {
+    let w = world(pool.clone()).await;
+
+    // A reading that succeeded does not surface a read-failed alert, even though the balance is low.
+    let ok = collect_alerts(
+        &w.db,
+        &AlertInputs {
+            relayer_balance_xlm: Some(Ok(1.0)),
+            min_relayer_xlm: 50.0,
+            latest_ledger: Some(10_000),
+            now: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(ok.iter().any(|a| a.key == "relayer_balance"), "low-balance alert still fires when the read succeeded");
+    assert!(ok.iter().all(|a| a.key != "relayer_balance_read_failed"));
+
+    // Simulate the failing signer fake: the real worker builds this from
+    // `ReleaseSigner::balance_xlm().await.map_err(|e| e.to_string())`.
+    let signer_error = ChainError::Simulation("account not found".to_string()).to_string();
+    let alerts = collect_alerts(
+        &w.db,
+        &AlertInputs {
+            relayer_balance_xlm: Some(Err(signer_error.clone())),
+            min_relayer_xlm: 50.0,
+            latest_ledger: Some(10_000),
+            now: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let read_fail = alerts.iter().find(|a| a.key == "relayer_balance_read_failed").expect("read-failed alert present");
+    assert!(read_fail.text.contains("account not found"));
+    // The two alerts are keyed separately so the sender's per-key cooldown does not swallow one when
+    // the operator has already acknowledged the other.
+    assert!(alerts.iter().all(|a| a.key != "relayer_balance"), "a failed read does not also fire low-balance");
+
+    // The AlertSender keys on `key`, so a second poll inside the cooldown is silent (not a storm).
+    let s = AlertSender::new(None, std::time::Duration::from_secs(60));
+    let t0 = Instant::now();
+    assert_eq!(s.send(&alerts, t0).await.len(), alerts.len());
+    assert!(s.send(&alerts, t0 + std::time::Duration::from_secs(10)).await.is_empty());
 }
 
 #[tokio::test]

@@ -11,11 +11,11 @@ use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer as _, SigningKey};
 use escrow_api::{AppState, limiter::RateLimiter, login::GithubLogin, metrics::Metrics, router, state::ApiConfig};
 use escrow_core::{
-    BountyStatus,
-    oauth::{OAUTH_COOKIE, clear_cookie},
+    BountyStatus, PayoutStatus,
+    oauth::{OAUTH_COOKIE, SESSION_COOKIE, clear_cookie},
     security::{csrf_token, hash_session_id, hmac_hex, sep53_hash},
 };
-use escrow_db::{Db, MIGRATOR, bounties, disputes, intents, payouts, prs, sessions, users};
+use escrow_db::{Db, MIGRATOR, audit, bounties, disputes, intents, payouts, prs, sessions, users};
 use escrow_engine::sync::{GithubNotifier, Tokens};
 use escrow_github::{GithubUser, OAuthError};
 use escrow_payouts::PayoutDeps;
@@ -62,10 +62,10 @@ struct Env {
 }
 
 fn env(pool: PgPool, with_login: bool, admins: Vec<i64>) -> Env {
-    env_with_lag(pool, with_login, admins, true)
+    env_with_lag(pool, with_login, admins, true, false)
 }
 
-fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_lag: bool) -> Env {
+fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_lag: bool, secure_cookies: bool) -> Env {
     let db = Db::from_pool(pool);
     let chain = Arc::new(FakeChain::default());
     *chain.ledger.lock().unwrap() = 1000;
@@ -83,9 +83,10 @@ fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_
             webhook_secret: WEBHOOK_SECRET.into(),
             api_public_url: "http://localhost:3001".into(),
             web_public_url: "http://localhost:3000".into(),
-            secure_cookies: false,
+            secure_cookies,
             admin_github_ids: admins,
             trust_proxy: false,
+            trust_proxy_hops: 1,
             metrics_token: None,
             explorer_tx_template: "https://explorer.example/tx/{hash}".into(),
             tokens: Tokens { usdc: "CUSDC".into(), xlm: "CTOKEN".into() },
@@ -103,6 +104,7 @@ fn env_with_lag(pool: PgPool, with_login: bool, admins: Vec<i64>, check_indexer_
         },
         limiter: Arc::new(RateLimiter::new(std::time::Duration::from_secs(60))),
         metrics: Arc::new(Metrics::default()),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         now: Utc::now,
     };
     Env { app: router(state), db, chain, txb, login }
@@ -164,6 +166,11 @@ fn stellar(seed_byte: u8) -> (SigningKey, String) {
     (sk.clone(), stellar_strkey::ed25519::PublicKey(sk.verifying_key().to_bytes()).to_string().to_string())
 }
 
+fn assert_valid_until(body: &Value, expected: u64) {
+    let raw = body["validUntil"].as_str().expect("build responses carry validUntil");
+    assert_eq!(chrono::DateTime::parse_from_rfc3339(raw).unwrap().timestamp(), i64::try_from(expected).unwrap(), "{raw}");
+}
+
 async fn fund(e: &Env, id: i64, issue: i32) {
     seed::repo(&e.db).await;
     seed::bounty(&e.db, &seed::B::new(id, issue)).await;
@@ -183,7 +190,7 @@ async fn health_reports_ok_and_503_when_the_indexer_is_far_behind(pool: PgPool) 
     assert_eq!(lagging.body["indexerLagLedgers"], 900);
 
     // API-only mode (escrowd serve): indexer lag is still reported but does not fail /health
-    let serve_env = env_with_lag(pool.clone(), true, vec![], false);
+    let serve_env = env_with_lag(pool.clone(), true, vec![], false, false);
     let serve_health = get(&serve_env, "/health").await;
     assert_eq!(serve_health.status, StatusCode::OK);
     assert_eq!((serve_health.body["ok"].clone(), serve_health.body["indexerLagLedgers"].clone()), (json!(true), json!(900)));
@@ -194,7 +201,9 @@ async fn every_response_carries_the_security_headers_and_errors_use_one_shape(po
     let e = env(pool, true, vec![]);
     let r = get(&e, "/bounties/abc").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(r.body, json!({ "error": { "code": "not_found", "message": "bounty not found" } }));
+    let request_id = r.headers["x-request-id"].to_str().unwrap().to_string();
+    assert!(!request_id.is_empty(), "every response carries a request id");
+    assert_eq!(r.body, json!({ "error": { "code": "not_found", "message": "bounty not found", "request_id": request_id } }));
     let h = &r.headers;
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(h["x-frame-options"], "DENY");
@@ -203,6 +212,27 @@ async fn every_response_carries_the_security_headers_and_errors_use_one_shape(po
     assert!(h["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
     let unknown = get(&e, "/nope").await;
     assert_eq!((unknown.status, unknown.body["error"]["code"].clone()), (StatusCode::NOT_FOUND, json!("not_found")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn request_ids_are_reused_when_well_formed_and_generated_otherwise(pool: PgPool) {
+    let e = env(pool, true, vec![]);
+    let supplied = "support-42";
+    let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-request-id", supplied.into())], None).await;
+    assert_eq!(r.headers["x-request-id"], supplied);
+    assert_eq!(r.body["error"]["request_id"], json!(supplied));
+
+    // Spaces are legal header bytes but not a safe id: replace it with a generated UUID.
+    let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-request-id", "not a valid id".into())], None).await;
+    let generated = r.headers["x-request-id"].to_str().unwrap().to_string();
+    assert_ne!(generated, "not a valid id");
+    assert_eq!(generated.len(), 36, "a generated UUID");
+    assert_eq!(r.body["error"]["request_id"], json!(generated));
+
+    // Webhook errors follow the same shape, even before a delivery id is known.
+    let denied = deliver(&e, "no-sig", "ping", "{}", None).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.body["error"]["request_id"].as_str(), denied.headers["x-request-id"].to_str().ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -348,6 +378,55 @@ async fn public_profiles_show_only_confirmed_payouts(pool: PgPool) {
     assert_eq!(get(&e, "/users/a%2Fb").await.status, StatusCode::NOT_FOUND);
 }
 
+async fn my_earnings_page(e: &Env, s: &Session, q: String) -> Resp {
+    call(&e.app, Method::GET, &format!("/me/earnings{q}"), &s.hdrs(false), None).await
+}
+
+// #139: both earnings lists page by `limit` and a keyset `cursor`, like `/bounties`.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn earnings_lists_are_paginated(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    for (id, issue) in [(5, 4), (6, 5)] {
+        fund_more(&e, id, issue).await;
+    }
+    users::upsert_github(&pool, 900, "dev", None, false).await.unwrap();
+    let mut ids = vec![];
+    for (bounty, pr) in [(4, 7), (5, 8), (6, 9)] {
+        let p = payouts::create_pending(&pool, bounty, pr, 900).await.unwrap().unwrap();
+        payouts::mark_confirmed(&pool, &p.id, Some(&format!("tx{pr}"))).await.unwrap();
+        ids.push(p.id);
+    }
+    let contributor = signed_in(&e, 900, "dev", Some("GCONTRIB"), false).await;
+    let me = |q: &str| my_earnings_page(&e, &contributor, q.to_string());
+
+    // newest first, two per page, then the rest
+    let p1 = me("?limit=2").await;
+    assert_eq!(p1.status, StatusCode::OK);
+    let got: Vec<&str> = p1.body["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(got, vec![ids[2].as_str(), ids[1].as_str()]);
+    assert_eq!(p1.body["nextCursor"].as_str(), Some(ids[1].as_str()));
+    let p2 = me(&format!("?limit=2&cursor={}", ids[1])).await;
+    assert_eq!(p2.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(p2.body["items"][0]["id"].as_str(), Some(ids[0].as_str()));
+    assert_eq!(p2.body["nextCursor"], Value::Null);
+    // the default page holds all three
+    assert_eq!(me("").await.body["items"].as_array().unwrap().len(), 3);
+    for bad in ["?limit=0", "?limit=51", "?limit=x", "?cursor=NOT-AN-ID", "?cursor=short"] {
+        assert_eq!(me(bad).await.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+
+    // the public profile pages its paid list the same way
+    let u1 = get(&e, "/users/dev?limit=2").await;
+    assert_eq!(u1.body["paid"].as_array().unwrap().len(), 2);
+    assert_eq!(u1.body["paid"][0]["txHash"].as_str(), Some("tx9"));
+    let cursor = u1.body["nextCursor"].as_str().unwrap().to_string();
+    let u2 = get(&e, &format!("/users/dev?limit=2&cursor={cursor}")).await;
+    assert_eq!((u2.body["paid"].as_array().unwrap().len(), u2.body["paid"][0]["txHash"].as_str()), (1, Some("tx7")));
+    assert_eq!(u2.body["nextCursor"], Value::Null);
+    assert_eq!(get(&e, "/users/dev?limit=100").await.status, StatusCode::BAD_REQUEST);
+}
+
 async fn fund_more(e: &Env, id: i64, issue: i32) {
     seed::bounty(&e.db, &seed::B::new(id, issue)).await;
     e.chain.put(id as u64, seed::MAINTAINER_WALLET, BountyStatus::Open, true, None);
@@ -376,7 +455,9 @@ async fn metrics_are_prometheus_text_and_can_require_a_token(pool: PgPool) {
     let m = get(&e, "/metrics").await;
     assert_eq!(m.status, StatusCode::OK);
     assert!(
-        m.text.contains("# TYPE skillescrow_http_requests_total counter") && m.text.contains("skillescrow_bounties{status=\"OPEN\"} 1"),
+        m.text.contains("# TYPE skillescrow_http_requests_total counter")
+            && m.text.contains("skillescrow_bounties{status=\"OPEN\"} 1")
+            && m.text.contains("skillescrow_metrics_db_up 1"),
         "{}",
         m.text
     );
@@ -391,6 +472,19 @@ fn set_cookies(r: &Resp) -> Vec<String> {
 
 fn cookie_pair(set_cookie: &str) -> String {
     set_cookie.split(';').next().unwrap().to_string()
+}
+
+fn cookie_name(set_cookie: &str) -> &str {
+    set_cookie.split('=').next().unwrap().trim()
+}
+
+/// Every attribute of a `Set-Cookie` except `Max-Age` (login keeps the cookie for its TTL, logout
+/// expires it immediately, so only the remaining attributes must agree).
+fn cookie_attributes(set_cookie: &str) -> Vec<String> {
+    let mut attrs: Vec<String> =
+        set_cookie.split(';').skip(1).map(str::trim).filter(|p| !p.starts_with("Max-Age")).map(str::to_string).collect();
+    attrs.sort();
+    attrs
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -512,6 +606,40 @@ async fn sessions_csrf_and_logout(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn logout_clears_the_session_cookie_with_the_same_attributes_as_login(pool: PgPool) {
+    // secure_cookies changes the Set-Cookie attributes, so the clearing cookie must follow it too
+    for secure in [false, true] {
+        let e = env_with_lag(pool.clone(), true, vec![], true, secure);
+
+        let start = get(&e, "/auth/login").await;
+        let oauth_cookie = cookie_pair(&set_cookies(&start).into_iter().find(|c| c.starts_with("se_oauth=")).unwrap());
+        let state =
+            start.headers[header::LOCATION].to_str().unwrap().split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let done =
+            call(&e.app, Method::GET, &format!("/auth/callback?code=good-code&state={state}"), &[("cookie", oauth_cookie)], None).await;
+        let login_cookie = set_cookies(&done).into_iter().find(|c| c.starts_with("se_session=")).unwrap();
+        assert_eq!(login_cookie.contains("Secure"), secure, "login cookie Secure flag follows secure_cookies");
+
+        let sid = cookie_pair(&login_cookie).strip_prefix("se_session=").unwrap().to_string();
+        let out = call(
+            &e.app,
+            Method::POST,
+            "/auth/logout",
+            &[("cookie", cookie_pair(&login_cookie)), ("x-csrf-token", csrf_token(CSRF, &sid))],
+            None,
+        )
+        .await;
+        assert_eq!(out.status, StatusCode::OK);
+        let cleared = set_cookies(&out).into_iter().find(|c| c.starts_with("se_session=")).unwrap();
+
+        assert_eq!(cookie_name(&cleared), SESSION_COOKIE);
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("Secure") == secure, "clearing cookie Secure flag follows secure_cookies: {cleared}");
+        assert_eq!(cookie_attributes(&cleared), cookie_attributes(&login_cookie), "cleared cookie attributes must match login");
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn expired_and_forged_sessions_are_rejected(pool: PgPool) {
     let e = env(pool.clone(), true, vec![]);
     let s = signed_in(&e, 1, "a", None, false).await;
@@ -554,10 +682,45 @@ async fn linking_a_wallet_needs_a_real_signature_over_the_challenge(pool: PgPool
         call(&e.app, Method::POST, "/wallet/verify", &s.hdrs(true), Some(json!({ "challengeId": id, "signature": sign(&sk, &msg) }))).await;
     assert_eq!((ok.status, ok.body["address"].as_str()), (StatusCode::OK, Some(addr.as_str())));
     assert_eq!(users::get(&pool, &s.user.id).await.unwrap().unwrap().wallet.as_deref(), Some(addr.as_str()));
+    let linked = audit::recent(&pool, 1).await.unwrap().remove(0);
+    assert_eq!(
+        (linked.actor.as_str(), linked.action.as_str(), linked.target.as_str()),
+        ("user:900", "wallet.linked", format!("user:{}", s.user.id).as_str())
+    );
+    assert_eq!(linked.data, json!({ "oldAddress": null, "newAddress": addr }));
     // single use
     let again =
         call(&e.app, Method::POST, "/wallet/verify", &s.hdrs(true), Some(json!({ "challengeId": id, "signature": sign(&sk, &msg) }))).await;
     assert_eq!((again.status, again.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("challenge_used")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn unlinking_a_wallet_is_audited_and_rate_limited(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let (_, addr) = stellar(8);
+    let s = signed_in(&e, 903, "unlinker", Some(&addr), false).await;
+    let uri = "/wallet";
+
+    assert_eq!(call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await.status, StatusCode::OK);
+    assert!(users::get(&pool, &s.user.id).await.unwrap().unwrap().wallet.is_none());
+    let rows = audit::recent(&pool, 50).await.unwrap();
+    let unlinked: Vec<_> = rows.iter().filter(|r| r.action == "wallet.unlinked").collect();
+    assert_eq!(unlinked.len(), 1);
+    assert_eq!(unlinked[0].actor, "user:903");
+    assert_eq!(unlinked[0].target, format!("user:{}", s.user.id));
+    assert_eq!(unlinked[0].data, json!({ "oldAddress": addr, "newAddress": null }));
+
+    for i in 0..19 {
+        assert_eq!(call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await.status, StatusCode::OK, "unlink {i}");
+    }
+    let limited = call(&e.app, Method::DELETE, uri, &s.hdrs(true), None).await;
+    assert_eq!((limited.status, limited.body["error"]["code"].clone()), (StatusCode::TOO_MANY_REQUESTS, json!("rate_limited")));
+    assert_eq!(audit::recent(&pool, 50).await.unwrap().iter().filter(|r| r.action == "wallet.unlinked").count(), 20);
+    assert_eq!(
+        call(&e.app, Method::DELETE, uri, &s.hdrs(false), None).await.status,
+        StatusCode::FORBIDDEN,
+        "unlinking still needs a csrf token"
+    );
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -696,10 +859,12 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
     payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
     let r = call(&e.app, Method::GET, "/me/earnings", &contributor.hdrs(false), None).await;
+    let first = &r.body["items"][0];
     assert_eq!(
-        (r.body[0]["status"].as_str(), r.body[0]["bounty"]["amount"].as_str(), r.body[0]["bounty"]["feeBps"].as_i64()),
+        (first["status"].as_str(), first["bounty"]["amount"].as_str(), first["bounty"]["feeBps"].as_i64()),
         (Some("CONFIRMED"), Some("50000000"), Some(300))
     );
+    assert_eq!(r.body["nextCursor"], Value::Null);
 
     let maintainer = signed_in(&e, 500, "maint", Some(seed::MAINTAINER_WALLET), false).await;
     let funded = call(&e.app, Method::GET, "/me/funded", &maintainer.hdrs(false), None).await;
@@ -707,6 +872,29 @@ async fn my_earnings_and_funded_bounties(pool: PgPool) {
     let no_wallet = signed_in(&e, 501, "nowallet", None, false).await;
     assert_eq!(call(&e.app, Method::GET, "/me/funded", &no_wallet.hdrs(false), None).await.body, json!([]));
     assert_eq!(get(&e, "/me/earnings").await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_renamed_repository_shows_its_new_issue_urls_on_the_detail_and_earnings(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let contributor = signed_in(&e, 900, "dev", Some("GCONTRIB"), false).await;
+    let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
+    payouts::mark_confirmed(&pool, &p.id, Some("h")).await.unwrap();
+    assert_eq!(get(&e, "/bounties/4").await.body["issueUrl"], "https://github.com/acme/widgets/issues/3");
+
+    // what the `repository.renamed` webhook and `sync-installations` both do
+    escrow_db::github::upsert_repo(&pool, seed::REPO_ID, seed::INSTALLATION, "acme/gadgets", false).await.unwrap();
+
+    let detail = get(&e, "/bounties/4").await;
+    assert_eq!(
+        (detail.body["issueUrl"].as_str(), detail.body["repo"]["fullName"].as_str()),
+        (Some("https://github.com/acme/gadgets/issues/3"), Some("acme/gadgets"))
+    );
+    let earnings = call(&e.app, Method::GET, "/me/earnings", &contributor.hdrs(false), None).await;
+    assert_eq!(earnings.body[0]["bounty"]["issueUrl"], "https://github.com/acme/gadgets/issues/3");
+    let listed = get(&e, "/bounties").await;
+    assert_eq!(listed.body["items"][0]["issueUrl"], "https://github.com/acme/gadgets/issues/3");
 }
 
 // ================= funding =================
@@ -768,6 +956,7 @@ async fn building_the_funding_transaction_checks_who_is_asking(pool: PgPool) {
     assert_eq!(ok.status, StatusCode::OK);
     let xdr = ok.body["xdr"].as_str().unwrap();
     assert!(xdr.starts_with("XDR[fund:") && xdr.contains(&format!(":{}:10:3:CTOKEN:50000000:false", addr)), "{xdr}");
+    assert_valid_until(&ok.body, e.txb.valid_until);
     // the deadline is the duration from now (+60 s of slack), and was passed to the chain builder
     let built = e.txb.built.lock().unwrap().clone();
     assert_eq!(built.len(), 1);
@@ -833,6 +1022,17 @@ async fn submitting_a_signed_transaction_is_relayed_and_failures_are_explained(p
         (bad.status, bad.body["error"]["code"].clone(), bad.body["error"]["message"].as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, json!("submit_rejected"), Some("this is not a call to the SkillEscrow contract"))
     );
+    for (raw, name, fragment) in [
+        ("HostError: Error(Contract, #9)", "IssueAlreadyFunded", "already has a bounty"),
+        ("HostError: Error(Contract, #12)", "DeadlineNotReached", "grace period"),
+    ] {
+        *e.txb.fail_with.lock().unwrap() = Some(escrow_chain::ChainError::Simulation(raw.into()));
+        let r = call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "AAAA-signed-envelope" }))).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.body["error"]["code"], json!("contract_error"));
+        assert_eq!(r.body["error"]["contractError"], json!(name));
+        assert!(r.body["error"]["message"].as_str().unwrap().contains(fragment), "{}", r.body);
+    }
     assert_eq!(call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "x" }))).await.status, StatusCode::BAD_REQUEST);
     assert_eq!(
         call(&e.app, Method::POST, "/tx/submit", &s.hdrs(true), Some(json!({ "xdr": "y".repeat(20_001) }))).await.status,
@@ -859,6 +1059,7 @@ async fn only_the_maintainers_wallet_can_ask_for_a_release_or_refund(pool: PgPoo
     }
     let ok = call(&e.app, Method::POST, "/bounties/4/refund/build", &maintainer.hdrs(true), None).await;
     assert_eq!((ok.status, ok.body["xdr"].as_str()), (StatusCode::OK, Some(format!("XDR[refund:{}:4]", seed::MAINTAINER_WALLET).as_str())));
+    assert_valid_until(&ok.body, e.txb.valid_until);
     assert_eq!(call(&e.app, Method::POST, "/bounties/9/refund/build", &maintainer.hdrs(true), None).await.status, StatusCode::NOT_FOUND);
 
     // the chain, not the database, decides whether it is still open
@@ -879,12 +1080,13 @@ async fn a_release_is_built_only_for_a_payout_waiting_on_the_maintainer(pool: Pg
     assert_eq!((none.status, none.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("nothing_to_release")));
 
     let p = payouts::create_pending(&pool, 4, 7, 900).await.unwrap().unwrap();
-    payouts::release_from_pending(&pool, &p.id, "AWAITING_MAINTAINER", "GWINNER").await.unwrap();
+    payouts::release_from_pending(&pool, &p.id, PayoutStatus::AwaitingMaintainer, "GWINNER").await.unwrap();
     let ok = call(&e.app, Method::POST, "/bounties/4/release/build", &maintainer.hdrs(true), None).await;
     assert_eq!(
         (ok.status, ok.body["winner"].as_str(), ok.body["xdr"].as_str()),
         (StatusCode::OK, Some("GWINNER"), Some(format!("XDR[release:{}:4:GWINNER]", seed::MAINTAINER_WALLET).as_str()))
     );
+    assert_valid_until(&ok.body, e.txb.valid_until);
 
     // a payout the relayer already owns is not the maintainer's to sign
     sqlx::query("UPDATE payouts SET status = 'QUEUED'").execute(&pool).await.unwrap();
@@ -948,6 +1150,7 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
     )
     .await;
     assert_eq!((open.status, open.body["xdr"].as_str()), (StatusCode::OK, Some(format!("XDR[open_dispute:{arbiter}:4]").as_str())));
+    assert_valid_until(&open.body, e.txb.valid_until);
     assert_eq!(
         call(
             &e.app,
@@ -963,6 +1166,9 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
 
     // the chain emits `disputed`; the indexer would do this:
     disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+    // #134 — resolve/build requires the chain itself to report Disputed; the
+    // indexer would have moved it when it saw the open_dispute event land.
+    e.chain.set_status(4, BountyStatus::Disputed);
     let again = call(
         &e.app,
         Method::POST,
@@ -1005,6 +1211,7 @@ async fn the_dispute_workflow_from_request_to_a_signable_resolution(pool: PgPool
     )
     .await;
     assert_eq!(split.body["xdr"].as_str(), Some(format!("XDR[resolve:{arbiter}:4:{winner}:6000]").as_str()));
+    assert_valid_until(&split.body, e.txb.valid_until);
     let refund = call(
         &e.app,
         Method::POST,
@@ -1037,10 +1244,148 @@ async fn a_dispute_can_be_rejected_with_a_note_once(pool: PgPool) {
     assert_eq!((row.status.as_str(), row.resolution_note.as_deref()), ("rejected", Some("no merit")));
     assert_eq!(call(&e.app, Method::POST, &uri, &admin.hdrs(true), Some(json!({ "note": "again" }))).await.status, StatusCode::CONFLICT);
     assert!(get_admin(&e, &admin, "/admin/disputes").await.body.as_array().unwrap().is_empty());
+
+    // #132: the arbiter's note is carried to GitHub by a durable, once-only comment job.
+    let jobs: Vec<(String, Value)> = sqlx::query_as("SELECT kind, payload FROM jobs").fetch_all(&pool).await.unwrap();
+    assert_eq!(jobs.len(), 1, "the rejected decision comments once, even after a repeated request");
+    assert_eq!(jobs[0].0, escrow_engine::jobs::DISPUTE_COMMENT);
+    assert_eq!(jobs[0].1["bountyId"], json!(4));
+    assert_eq!(jobs[0].1["note"], json!("no merit"));
+    assert_eq!(jobs[0].1["key"], json!(format!("rejected:{}", d.id)));
 }
 
 async fn get_admin(e: &Env, s: &Session, uri: &str) -> Resp {
     call(&e.app, Method::GET, uri, &s.hdrs(false), None).await
+}
+
+// #134 — building a dispute transaction is refused when the chain's view of
+// the bounty disagrees with what the route needs. The check sits on the
+// shared `require_chain_status` helper rather than being duplicated per route.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn open_onchain_is_refused_when_the_bounty_is_no_longer_open_on_chain(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+    let (_, arbiter) = stellar(9);
+    let d = disputes::create(&pool, 4, 500, "late").await.unwrap();
+    // chain says the bounty was already refunded or released by the maintainer
+    e.chain.set_status(4, BountyStatus::Released);
+
+    let r = call(
+        &e.app,
+        Method::POST,
+        &format!("/admin/disputes/{}/open-onchain", d.id),
+        &admin.hdrs(true),
+        Some(json!({ "arbiterAddress": arbiter })),
+    )
+    .await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("not_open")));
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("RELEASED"));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn resolve_build_is_refused_when_the_bounty_is_not_disputed_on_chain(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    fund(&e, 4, 3).await;
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+    let (_, arbiter) = stellar(9);
+    let (_, winner) = stellar(10);
+    let d = disputes::create(&pool, 4, 500, "late").await.unwrap();
+    // the DB row looks ready to resolve, but the chain still has it Open
+    disputes::mark_opened_onchain(&pool, 4).await.unwrap();
+
+    let r = call(
+        &e.app,
+        Method::POST,
+        &format!("/admin/disputes/{}/resolve/build", d.id),
+        &admin.hdrs(true),
+        Some(json!({ "arbiterAddress": arbiter, "winner": winner, "winnerBps": 5000 })),
+    )
+    .await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("not_disputed")));
+    assert!(r.body["error"]["message"].as_str().unwrap().contains("OPEN"));
+}
+
+// #133 — The audit log browse endpoint.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn admin_audit_log_browse_supports_filters_and_pagination(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let admin = signed_in(&e, 1, "arb", None, true).await;
+
+    // Non-admin is forbidden.
+    let plain = signed_in(&e, 2, "u", None, false).await;
+    let forbidden = call(&e.app, Method::GET, "/admin/audit", &plain.hdrs(false), None).await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+
+    // Unauthenticated is also rejected.
+    assert_eq!(get(&e, "/admin/audit").await.status, StatusCode::UNAUTHORIZED);
+
+    audit::log(&pool, "admin:1", "payout.retry", "payout:a", &json!({})).await.unwrap();
+    audit::log(&pool, "admin:1", "dispute.rejected", "dispute:b", &json!({})).await.unwrap();
+    audit::log(&pool, "admin:2", "payout.retry", "payout:c", &json!({})).await.unwrap();
+
+    let all = get_admin(&e, &admin, "/admin/audit").await;
+    assert_eq!(all.status, StatusCode::OK);
+    assert_eq!(all.body["items"].as_array().unwrap().len(), 3, "{all:?}");
+    assert_eq!(all.body["items"][0]["target"].as_str(), Some("payout:c"), "newest first");
+
+    let by_actor = get_admin(&e, &admin, "/admin/audit?actor=admin:2").await;
+    assert_eq!(by_actor.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(by_actor.body["items"][0]["actor"].as_str(), Some("admin:2"));
+
+    let by_action = get_admin(&e, &admin, "/admin/audit?action=payout.retry").await;
+    assert_eq!(by_action.body["items"].as_array().unwrap().len(), 2);
+    assert!(by_action.body["items"].as_array().unwrap().iter().all(|r| r["action"] == "payout.retry"));
+
+    let by_prefix = get_admin(&e, &admin, "/admin/audit?targetPrefix=payout:").await;
+    assert_eq!(by_prefix.body["items"].as_array().unwrap().len(), 2);
+
+    let page1 = get_admin(&e, &admin, "/admin/audit?limit=2").await;
+    assert_eq!(page1.body["items"].as_array().unwrap().len(), 2);
+    let cursor = page1.body["nextCursor"].as_str().expect("more rows produce a cursor").to_string();
+    let page2 = get_admin(&e, &admin, &format!("/admin/audit?limit=2&cursor={cursor}")).await;
+    let pg2_items = page2.body["items"].as_array().unwrap();
+    assert_eq!(pg2_items.len(), 1);
+    assert!(page2.body["nextCursor"].is_null(), "last page has no cursor");
+
+    // Query validation rejects bad input instead of running the scan.
+    assert_eq!(get_admin(&e, &admin, "/admin/audit?limit=0").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(get_admin(&e, &admin, "/admin/audit?cursor=BAD!").await.status, StatusCode::BAD_REQUEST);
+}
+
+// #127 — The webhook receiver drops events the backend has no handler for
+// with a 202, counting them but never writing to the queue.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn an_unhandled_webhook_event_is_acknowledged_without_creating_a_job(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = r#"{"action":"created"}"#;
+    // `star` is not in HANDLED_WEBHOOK_EVENTS; it should 202 without queuing.
+    let r = deliver(&e, "star-1", "star", body, Some(sign_body(body))).await;
+    assert_eq!((r.status, r.body["ignored"].clone()), (StatusCode::ACCEPTED, json!(true)));
+    let (deliveries, jobs): (i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries").fetch_one(&pool).await.unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM jobs").fetch_one(&pool).await.unwrap(),
+    );
+    assert_eq!((deliveries, jobs), (0, 0), "unhandled events must not write delivery rows or jobs");
+
+    let m = get(&e, "/metrics").await;
+    assert!(m.text.contains("skillescrow_webhooks_ignored_total 1"), "{}", m.text);
+}
+
+// #126 — Over-long delivery headers are a rejection, counted like any other
+// 4xx on the metrics side so dashboards see them.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn over_long_delivery_headers_are_counted_as_rejected(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = "{}";
+    let long_id = "a".repeat(101);
+    let r = deliver(&e, &long_id, "issue_comment", body, Some(sign_body(body))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let m = get(&e, "/metrics").await;
+    // Both the bad-signature and bad-JSON cases already bump this counter;
+    // the over-long-headers case must now too.
+    assert!(m.text.contains("skillescrow_webhooks_rejected_total 1"), "{}", m.text);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1135,8 +1480,9 @@ async fn deliver(e: &Env, id: &str, event: &str, body: &str, sig: Option<String>
     let r = h.iter().fold(r, |r, (k, v)| r.header(*k, v)).body(Body::from(body.to_string())).unwrap();
     let resp = e.app.clone().oneshot(r).await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
-    Resp { status, headers: Default::default(), body: serde_json::from_str(&text).unwrap_or(Value::Null), text }
+    Resp { status, headers, body: serde_json::from_str(&text).unwrap_or(Value::Null), text }
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1155,6 +1501,51 @@ async fn a_signed_webhook_is_recorded_and_queued_exactly_once(pool: PgPool) {
     assert_eq!((deliveries, jobs), (1, 1));
     let payload: Value = sqlx::query_scalar("SELECT payload FROM jobs").fetch_one(&pool).await.unwrap();
     assert_eq!((payload["event"].as_str(), payload["payload"]["comment"]["body"].as_str()), (Some("issue_comment"), Some("/bounty 5")));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn redelivery_of_a_failed_webhook_is_queued_again_but_success_and_queued_are_duplicates(pool: PgPool) {
+    let e = env(pool.clone(), true, vec![]);
+    let body = r#"{"action":"created"}"#;
+    let sig = Some(sign_body(body));
+
+    // A delivery whose worker gave up is not a duplicate: GitHub's Redeliver button must work.
+    assert_eq!(deliver(&e, "failed-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    sqlx::query("UPDATE jobs SET status = 'dead', last_error = 'boom' WHERE dedupe_key = 'webhook:failed-1'").execute(&pool).await.unwrap();
+    escrow_db::webhooks::mark_processed(&pool, "failed-1", Some("boom")).await.unwrap();
+    let retry = deliver(&e, "failed-1", "ping", body, sig.clone()).await;
+    assert_eq!((retry.status, retry.body["queued"].clone()), (StatusCode::ACCEPTED, json!(true)));
+    let failed_error: Option<String> =
+        sqlx::query_scalar("SELECT error FROM webhook_deliveries WHERE id = 'failed-1'").fetch_one(&pool).await.unwrap();
+    assert!(failed_error.is_none(), "the terminal failure was cleared for the retry");
+    // The retry is now queued, so a third redelivery is a duplicate again.
+    let again = deliver(&e, "failed-1", "ping", body, sig.clone()).await;
+    assert_eq!((again.status, again.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    // A successfully processed delivery stays a duplicate.
+    assert_eq!(deliver(&e, "ok-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    sqlx::query("UPDATE jobs SET status = 'done' WHERE dedupe_key = 'webhook:ok-1'").execute(&pool).await.unwrap();
+    escrow_db::webhooks::mark_processed(&pool, "ok-1", None).await.unwrap();
+    let dup = deliver(&e, "ok-1", "ping", body, sig.clone()).await;
+    assert_eq!((dup.status, dup.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    // A delivery still waiting in the queue is a duplicate too.
+    assert_eq!(deliver(&e, "queued-1", "ping", body, sig.clone()).await.status, StatusCode::ACCEPTED);
+    let dup = deliver(&e, "queued-1", "ping", body, sig).await;
+    assert_eq!((dup.status, dup.body["duplicate"].clone()), (StatusCode::OK, json!(true)));
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:failed-1'").fetch_one(&pool).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:ok-1'").fetch_one(&pool).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE dedupe_key = 'webhook:queued-1'").fetch_one(&pool).await.unwrap(),
+        1
+    );
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1213,6 +1604,24 @@ async fn mutations_are_rate_limited_per_user_not_shared(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn a_users_sessions_share_one_mutation_budget(pool: PgPool) {
+    let e = env(pool, true, vec![]);
+    // signing in twice creates two sessions for the same GitHub user
+    let s1 = signed_in(&e, 1, "a", None, false).await;
+    let s2 = signed_in(&e, 1, "a", None, false).await;
+    assert_ne!(s1.cookie, s2.cookie, "each sign-in gets its own session");
+    let hit = |s: &Session| {
+        let (app, h) = (e.app.clone(), s.hdrs(true));
+        async move { call(&app, Method::POST, "/wallet/challenge", &h, Some(json!({ "address": "GBAD" }))).await.status }
+    };
+    for _ in 0..20 {
+        assert_eq!(hit(&s1).await, StatusCode::BAD_REQUEST);
+    }
+    // the budget is keyed by user, so a fresh session cannot mint a new allowance
+    assert_eq!(hit(&s2).await, StatusCode::TOO_MANY_REQUESTS, "the second session shares the user's spent budget");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn the_global_ceiling_protects_every_route_but_health(pool: PgPool) {
     let e = env(pool, true, vec![]);
     for _ in 0..300 {
@@ -1230,6 +1639,57 @@ async fn x_forwarded_for_is_ignored_unless_the_proxy_is_trusted(pool: PgPool) {
         call(&e.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", format!("10.0.0.{}", i % 250))], None).await;
     }
     let r = call(&e.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", "203.0.113.9".into())], None).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn spoofed_left_most_x_forwarded_for_cannot_bypass_rate_limit_when_trust_proxy_enabled(pool: PgPool) {
+    let mut state = env(pool, true, vec![]);
+    // Rebuild router with trust_proxy enabled and 1 trusted hop.
+    let db = state.db;
+    let chain = state.chain;
+    let txb = state.txb;
+    let login = state.login;
+    let app = router(AppState {
+        db: db.clone(),
+        cfg: Arc::new(ApiConfig {
+            csrf_secret: CSRF.into(),
+            session_secret: SESSION.into(),
+            webhook_secret: WEBHOOK_SECRET.into(),
+            api_public_url: "http://localhost:3001".into(),
+            web_public_url: "http://localhost:3000".into(),
+            secure_cookies: false,
+            admin_github_ids: vec![],
+            trust_proxy: true,
+            trust_proxy_hops: 1,
+            metrics_token: None,
+            explorer_tx_template: "https://explorer.example/tx/{hash}".into(),
+            tokens: Tokens { usdc: "CUSDC".into(), xlm: "CTOKEN".into() },
+            network: "testnet".into(),
+            check_indexer_lag: true,
+        }),
+        chain: chain.clone(),
+        txb: txb.clone(),
+        login: Some(login as Arc<dyn GithubLogin>),
+        payouts: PayoutDeps {
+            db: db.clone(),
+            chain,
+            notifier: Arc::new(GithubNotifier { db, gh: Arc::new(FakeGithub::new()) }),
+            web_url: "http://localhost:3000".into(),
+        },
+        limiter: Arc::new(RateLimiter::new(std::time::Duration::from_secs(60))),
+        metrics: Arc::new(Metrics::default()),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        now: Utc::now,
+    });
+    state.app = app;
+
+    // Rotating the spoofed left-most entry still resolves to the proxy-observed right-most entry (203.0.113.9).
+    for i in 0..300 {
+        let xff = format!("10.0.0.{}, 203.0.113.9", i % 250);
+        call(&state.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", xff)], None).await;
+    }
+    let r = call(&state.app, Method::GET, "/bounties/abc", &[("x-forwarded-for", "198.51.100.77, 203.0.113.9".into())], None).await;
     assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
 }
 

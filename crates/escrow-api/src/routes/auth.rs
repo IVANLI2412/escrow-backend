@@ -4,30 +4,35 @@ use crate::{
     error::{ApiError, ApiResult},
     extract::{ApiJson, ClientIp},
     metrics::Metrics,
-    session::{self, limit_key, require_user},
+    routes::public::{EarningsQuery, earnings_page},
+    session::{self, Authed, limit_key, require_user},
     state::AppState,
     wallet,
 };
 use axum::{
     Json,
     extract::{Extension, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Redirect, Response},
 };
 use escrow_core::{
-    oauth::{OAUTH_COOKIE, SESSION_COOKIE, StateError, clear_cookie, cookie_value, safe_next, session_cookie, start_login, state_cookie, verify_state},
+    oauth::{
+        OAUTH_COOKIE, SESSION_COOKIE, StateError, clear_cookie, cookie_value, safe_next, session_cookie, start_login, state_cookie,
+        verify_state,
+    },
     security::csrf_token,
 };
-use escrow_db::{bounties, payouts, users};
+use escrow_db::{bounties, users};
 use escrow_github::OAuthError;
 use escrow_payouts::on_wallet_linked;
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Instant;
 
-/// Per-user (or per-IP) budget for state-changing calls.
-pub fn mutation_limit(s: &AppState, h: &HeaderMap, ip: &ClientIp, max: u32) -> ApiResult<()> {
-    if s.limiter.check(&format!("m:{}", limit_key(h, &ip.0)), max, Instant::now()) {
+/// Per-user budget for state-changing calls: keyed by the verified user, or by address when there is
+/// no signed-in user. Pass the `Authed` from `require_user`; never key off an unverified cookie.
+pub fn mutation_limit(s: &AppState, user: Option<&Authed>, ip: &ClientIp, max: u32) -> ApiResult<()> {
+    if s.limiter.check(&format!("m:{}", limit_key(user, &ip.0)), max, Instant::now()) {
         Ok(())
     } else {
         Metrics::inc(&s.metrics.http_rate_limited);
@@ -120,7 +125,8 @@ pub async fn me(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json
 pub async fn logout(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let a = require_user(&s, &headers, true).await?;
     session::destroy(&s.db, &a.session_id).await?;
-    Ok(([(header::SET_COOKIE, clear_cookie(SESSION_COOKIE, s.cfg.secure_cookies))], Json(json!({ "ok": true }))).into_response())
+    let clearing: HeaderValue = clear_cookie(SESSION_COOKIE, s.cfg.secure_cookies).parse().expect("ascii");
+    Ok(([(header::SET_COOKIE, clearing)], Json(json!({ "ok": true }))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -135,7 +141,7 @@ pub async fn wallet_challenge(
     ApiJson(b): ApiJson<AddressBody>,
 ) -> ApiResult<Json<wallet::Challenge>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
     Ok(Json(wallet::create_challenge(&s.db, &a.user.id, &b.address, (s.now)()).await?))
 }
 
@@ -153,8 +159,8 @@ pub async fn wallet_verify(
     ApiJson(b): ApiJson<VerifyBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    mutation_limit(&s, &headers, &ip, 20)?;
-    let address = wallet::verify_challenge(&s.db, &a.user.id, &b.challenge_id, &b.signature, (s.now)()).await?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
+    let address = wallet::verify_challenge(&s.db, &a.user, &b.challenge_id, &b.signature, (s.now)()).await?;
     Metrics::inc(&s.metrics.wallets_linked);
     // a payout that was waiting for this wallet continues now; the link itself has already succeeded
     if let Err(e) = on_wallet_linked(&s.payouts, a.user.github_id).await {
@@ -163,21 +169,29 @@ pub async fn wallet_verify(
     Ok(Json(json!({ "address": address })))
 }
 
-pub async fn wallet_unlink(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
+pub async fn wallet_unlink(
+    State(s): State<AppState>,
+    Extension(ip): Extension<ClientIp>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
     let a = require_user(&s, &headers, true).await?;
-    wallet::unlink(&s.db, &a.user.id).await?;
+    mutation_limit(&s, Some(&a), &ip, 20)?;
+    wallet::unlink(&s.db, &a.user).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn my_earnings(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+pub async fn my_earnings(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    q: Result<Query<EarningsQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Response> {
     let a = require_user(&s, &headers, false).await?;
-    Ok(Json(payouts::earnings(&s.db.pool, a.user.github_id, false).await?).into_response())
+    let page = earnings_page(&s, a.user.github_id, false, q).await?;
+    Ok(Json(json!({ "items": page.items, "nextCursor": page.next_cursor })).into_response())
 }
 
 pub async fn my_funded(State(s): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let a = require_user(&s, &headers, false).await?;
-    let Some(w) = a.user.wallet else {
-        return Ok((StatusCode::OK, Json(json!([]))).into_response());
-    };
-    Ok(Json(bounties::by_maintainer(&s.db.pool, &w).await?).into_response())
+    // the current wallet's bounties plus any recorded against this account (e.g. funded from an earlier wallet)
+    Ok(Json(bounties::by_maintainer(&s.db.pool, a.user.wallet.as_deref(), a.user.github_id).await?).into_response())
 }
