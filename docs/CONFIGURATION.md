@@ -36,6 +36,7 @@ Secrets never appear in logs or `Debug` output.
 | `STELLAR_NETWORK` | `testnet` | `testnet`, `mainnet` or `local`. Sets the passphrase and explorer defaults. |
 | `STELLAR_RPC_URL` | testnet: `https://soroban-testnet.stellar.org` | **Required on mainnet**: choose a provider on purpose. |
 | `STELLAR_NETWORK_PASSPHRASE` | by network | Override only for `local`/custom networks. |
+| `STELLAR_RPC_TIMEOUT_SECS` | `20` | How long a single Soroban RPC call may take. Raise for slower self-hosted or paid providers; lower to fail fast in dev. Must be `>= 1`. |
 | `TOKEN_XLM_CONTRACT_ID`, `TOKEN_USDC_CONTRACT_ID` | empty | The token contracts bounties can be paid in. **Leave one empty to disable that token** (a non-empty value must be a `C…` 56-character contract id, or startup fails) (`/bounty … USDC` is then refused with a clear message). On testnet, the native XLM token's contract id is the Stellar Asset Contract for native; USDC needs a verified issuer's contract. |
 | `TOKEN_MIN_AMOUNT`, `TOKEN_MAX_AMOUNT` | `1`, `500` | Per-bounty limits **in whole tokens**, enforced when parsing `/bounty`. The contract enforces its own (authoritative) limits too. |
 | `MIN_DAYS`, `MAX_DAYS` | `1`, `90` | Allowed bounty duration. |
@@ -58,6 +59,7 @@ Secrets never appear in logs or `Debug` output.
 |---|---|---|
 | `RELAYER_SECRET` | none | A funded `S…` secret key whose address is registered in the contract as the relayer. **Refused on mainnet** (start-up error): use a KMS-backed signer there. At worker start the address is compared with the contract's registered relayer; a mismatch disables automatic payouts and logs an error rather than burning attempts. |
 | `RELAYER_MIN_XLM_ALERT` | `50` | Alert when the relayer's balance drops below this. |
+| `RELAYER_CONFIRM_WAIT_SECS` | `60` | How long the relayer waits for a submitted release to confirm, in seconds. Must be `1`..=`120` (the submit-validity window). Raise on congested networks; tests use a few milliseconds. |
 | `ALERT_WEBHOOK_URL` | none | Receives `{ "text": "SkillEscrow: …" }` for each alert (Slack-compatible), each distinct message at most once an hour. **Must be a valid `https://` URL** (except on `STELLAR_NETWORK=local` where `http://` is accepted). Validated at start-up; malformed URLs cause a configuration error. |
 
 ## AI review (optional, advisory)

@@ -356,41 +356,76 @@ pub async fn min_untracked_ledger_for_repo(db: &Db, repo_id: i64) -> Result<Opti
 }
 
 pub async fn run(d: IndexerDeps, stop: CancellationToken, interval: StdDuration) {
-    let mut consecutive_failures: u32 = 0;
-    let mut backoff: StdDuration = StdDuration::from_secs(1);
-
-    while !stop.is_cancelled() {
-        match poll_once(&d).await {
-            Ok(r) => {
-                consecutive_failures = 0;
-                backoff = StdDuration::from_secs(1);
-                if r.applied > 0 || r.anomalies > 0 {
-                    tracing::info!(?r, "indexed");
+    // #111: the indexer is the only writer of bounty status, and two instances racing on the
+    // cursor produce duplicate card/payout jobs. A Postgres session-scoped advisory lock gates
+    // the loop; the standby retries at the poll interval and takes over if the leader dies.
+    let mut announced_standby = false;
+    loop {
+        if stop.is_cancelled() {
+            break;
+        }
+        let mut leader = match escrow_db::leader::try_acquire(&d.db.pool, escrow_db::leader::INDEXER_LOCK_ID).await {
+            Ok(Some(l)) => {
+                tracing::info!("indexer: acquired leader lock");
+                announced_standby = false;
+                l
+            }
+            Ok(None) => {
+                if !announced_standby {
+                    tracing::info!(interval_secs = interval.as_secs(), "indexer: standing by - another instance holds the leader lock");
+                    announced_standby = true;
                 }
-                if !r.caught_up {
-                    // Still behind, poll again immediately without sleeping the full interval
+                tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(interval) => continue }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "indexer: could not query the leader lock; retrying after the poll interval");
+                tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(interval) => continue }
+            }
+        };
+
+        let mut consecutive_failures: u32 = 0;
+        let mut backoff: StdDuration = StdDuration::from_secs(1);
+
+        while !stop.is_cancelled() {
+            match poll_once(&d).await {
+                Ok(r) => {
+                    consecutive_failures = 0;
+                    backoff = StdDuration::from_secs(1);
+                    if r.applied > 0 || r.anomalies > 0 {
+                        tracing::info!(?r, "indexed");
+                    }
+                    if !r.caught_up {
+                        // Still behind, poll again immediately without sleeping the full interval
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "indexer poll failed");
+                    consecutive_failures += 1;
+                    if consecutive_failures >= FAILURE_ALERT_THRESHOLD {
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            "indexer has failed repeatedly; alerting"
+                        );
+                    }
+                    // Back off up to a cap while failing
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(StdDuration::from_secs(MAX_BACKOFF_SECS));
                     continue;
                 }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "indexer poll failed");
-                consecutive_failures += 1;
-                if consecutive_failures >= FAILURE_ALERT_THRESHOLD {
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        "indexer has failed repeatedly; alerting"
-                    );
-                }
-                // Back off up to a cap while failing
-                tokio::select! {
-                    _ = stop.cancelled() => break,
-                    _ = tokio::time::sleep(backoff) => {}
-                }
-                backoff = (backoff * 2).min(StdDuration::from_secs(MAX_BACKOFF_SECS));
-                continue;
+            // Keepalive on the leader connection: a dead ping means another worker may
+            // already hold the lock. Break out and recompete at the top of the outer loop.
+            if let Err(e) = leader.ping().await {
+                tracing::warn!(error = %e, "indexer: leader connection lost, will try to reacquire");
+                break;
             }
+            tokio::select! { _ = stop.cancelled() => return, _ = tokio::time::sleep(interval) => {} }
         }
-        tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(interval) => {} }
+        drop(leader);
     }
 }

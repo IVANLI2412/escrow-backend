@@ -26,6 +26,8 @@ pub struct ChainSettings {
 }
 
 impl ChainSettings {
+    /// Builds settings with the default 20 s RPC timeout. Use [`Self::with_timeout`] from
+    /// `runtime` to apply a configured `STELLAR_RPC_TIMEOUT_SECS` (#112).
     pub fn new(rpc_url: &str, network_passphrase: &str, contract_id: &str) -> Self {
         Self {
             rpc_url: rpc_url.into(),
@@ -33,6 +35,13 @@ impl ChainSettings {
             contract_id: contract_id.into(),
             timeout: Duration::from_secs(20),
         }
+    }
+
+    /// #112: lets the runtime apply the operator-tuned RPC timeout. Separate from `new` so
+    /// existing callers (fake RPC tests, `escrowd doctor`) keep the 20 s default.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 

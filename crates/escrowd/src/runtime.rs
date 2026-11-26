@@ -97,8 +97,12 @@ pub async fn connect(cfg: Config, migrate: bool) -> Result<Runtime> {
     if migrate {
         db.migrate().await.context("could not apply database migrations")?;
     }
-    let chain = SorobanChain::new(&ChainSettings::new(&cfg.rpc_url, &cfg.network_passphrase, &cfg.contract_id))
-        .context("invalid chain settings")?;
+    let chain = SorobanChain::new(
+        &ChainSettings::new(&cfg.rpc_url, &cfg.network_passphrase, &cfg.contract_id)
+            // #112: operator-tuned RPC timeout. Validated as >= 1 in Config::from_map.
+            .with_timeout(Duration::from_secs(cfg.stellar_rpc_timeout_secs)),
+    )
+    .context("invalid chain settings")?;
     let (gh, github_configured): (Arc<dyn GithubApi>, bool) = match &cfg.github {
         Some(g) => (Arc::new(GithubClient::new(GithubClientConfig::new(&g.app_id, &g.private_key)).context("GitHub App key")?), true),
         None => (Arc::new(NoGithub), false),
@@ -108,7 +112,9 @@ pub async fn connect(cfg: Config, migrate: bool) -> Result<Runtime> {
             Relayer::new(chain.clone(), s)
                 .context("RELAYER_SECRET")?
                 .with_channel_secrets(&cfg.relayer_channel_secrets)
-                .context("RELAYER_CHANNEL_SECRETS")?,
+                .context("RELAYER_CHANNEL_SECRETS")?
+                // #113: operator-tuned confirmation wait, validated 1..=120 in Config::from_map.
+                .with_confirm_wait(Duration::from_secs(cfg.relayer_confirm_wait_secs)),
         )),
         None => None,
     };
