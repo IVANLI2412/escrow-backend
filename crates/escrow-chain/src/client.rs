@@ -5,9 +5,9 @@ use crate::{
     events::{RawEvent, cursor_ledger},
     keys,
     ports::{ChainReader, EventSource, TxBuilder},
-    rpc::{EventsWire, GetTxWire, LatestLedgerWire, LedgerEntriesWire, RpcClient, SendWire, SimulateWire, SimulationOk, describe_tx_error},
+    rpc::{EventsWire, GetTxWire, LatestLedgerWire, LedgerEntriesWire, RetryPolicy, RpcClient, SendWire, SimulateWire, SimulationOk, describe_tx_error},
     scval, tx,
-    types::{ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
+    types::{BuiltTx, ChainBounty, ContractConfig, EventsPage, FundParams, TxOutcome},
 };
 use async_trait::async_trait;
 use escrow_core::BountyStatus;
@@ -81,7 +81,7 @@ impl SorobanChain {
 
     pub(crate) async fn simulate_wire(&self, tx: &Transaction) -> Result<SimulateWire, ChainError> {
         let xdr = tx::to_b64(&tx::envelope(tx.clone()))?;
-        self.rpc.call("simulateTransaction", json!({ "transaction": xdr })).await
+        self.rpc.call("simulateTransaction", json!({ "transaction": xdr }), Some(RetryPolicy::DEFAULT_READ)).await
     }
 
     pub(crate) async fn simulate(&self, tx: &Transaction) -> Result<SimulationOk, ChainError> {
@@ -93,7 +93,8 @@ impl SorobanChain {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(keys::account_bytes(address)?))),
         });
-        let wire: LedgerEntriesWire = self.rpc.call("getLedgerEntries", json!({ "keys": [key.to_xdr_base64(Limits::none())?] })).await?;
+        let wire: LedgerEntriesWire =
+            self.rpc.call("getLedgerEntries", json!({ "keys": [key.to_xdr_base64(Limits::none())?] }), Some(RetryPolicy::DEFAULT_READ)).await?;
         let entry = wire
             .entries
             .and_then(|e| e.into_iter().next())
@@ -110,16 +111,19 @@ impl SorobanChain {
     }
 
     /// Builds, simulates and assembles a call for `source` to sign. Returns the unsigned envelope as base64.
-    async fn prepare(&self, source: &str, function: &str, args: Vec<ScVal>) -> Result<String, ChainError> {
+    async fn prepare(&self, source: &str, function: &str, args: Vec<ScVal>) -> Result<BuiltTx, ChainError> {
         let (seq, _) = self.account(source).await?;
         let t = tx::invoke_tx(keys::account_bytes(source)?, seq + 1, self.contract, function, args, tx::now_secs() + USER_TX_VALID_SECS)?;
         let sim = self.simulate(&t).await?;
-        tx::to_b64(&tx::envelope(tx::assemble(t, &sim)?))
+        let built = tx::assemble(t, &sim)?;
+        let valid_until = tx::max_time(&built).ok_or_else(|| ChainError::Decode("prepared transaction has no time bound".into()))?;
+        Ok(BuiltTx { xdr: tx::to_b64(&tx::envelope(built))?, valid_until })
     }
 
     /// Submits a signed envelope; returns the hash. `PENDING` and `DUPLICATE` both mean "it is on its way".
     pub(crate) async fn send(&self, xdr_b64: &str) -> Result<(), ChainError> {
-        let w: SendWire = self.rpc.call("sendTransaction", json!({ "transaction": xdr_b64 })).await?;
+        // sendTransaction is never retried automatically to avoid duplicate submissions on ambiguous failures.
+        let w: SendWire = self.rpc.call("sendTransaction", json!({ "transaction": xdr_b64 }), None).await?;
         match w.status.as_str() {
             "PENDING" | "DUPLICATE" => Ok(()),
             "TRY_AGAIN_LATER" => Err(ChainError::Busy),
@@ -132,7 +136,7 @@ impl SorobanChain {
         let start = std::time::Instant::now();
         let mut delay = Duration::from_millis(500);
         loop {
-            let w: GetTxWire = self.rpc.call("getTransaction", json!({ "hash": hash })).await?;
+            let w: GetTxWire = self.rpc.call("getTransaction", json!({ "hash": hash }), Some(RetryPolicy::DEFAULT_READ)).await?;
             match w.status.as_str() {
                 "SUCCESS" => return Ok(TxOutcome::Success),
                 "FAILED" => return Ok(TxOutcome::Failed),
@@ -197,7 +201,7 @@ impl ChainReader for SorobanChain {
     }
 
     async fn latest_ledger(&self) -> Result<u32, ChainError> {
-        let w: LatestLedgerWire = self.rpc.call("getLatestLedger", json!({})).await?;
+        let w: LatestLedgerWire = self.rpc.call("getLatestLedger", json!({}), Some(RetryPolicy::DEFAULT_READ)).await?;
         Ok(w.sequence)
     }
 }
@@ -227,7 +231,7 @@ impl EventSource for SorobanChain {
             "filters": [{ "type": "contract", "contractIds": [self.contract_id()] }],
             "pagination": { "limit": limit },
         });
-        let w: EventsWire = self.rpc.call("getEvents", params).await?;
+        let w: EventsWire = self.rpc.call("getEvents", params, Some(RetryPolicy::DEFAULT_READ)).await?;
         Ok(page(w, ""))
     }
 
@@ -236,14 +240,14 @@ impl EventSource for SorobanChain {
             "filters": [{ "type": "contract", "contractIds": [self.contract_id()] }],
             "pagination": { "cursor": cursor, "limit": limit },
         });
-        let w: EventsWire = self.rpc.call("getEvents", params).await?;
+        let w: EventsWire = self.rpc.call("getEvents", params, Some(RetryPolicy::DEFAULT_READ)).await?;
         Ok(page(w, cursor))
     }
 }
 
 #[async_trait]
 impl TxBuilder for SorobanChain {
-    async fn build_fund(&self, p: &FundParams) -> Result<String, ChainError> {
+    async fn build_fund(&self, p: &FundParams) -> Result<BuiltTx, ChainError> {
         let args = vec![
             scval::address(&p.maintainer)?,
             scval::u64v(p.repo_id),
@@ -256,20 +260,20 @@ impl TxBuilder for SorobanChain {
         self.prepare(&p.maintainer, "fund_bounty", args).await
     }
 
-    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<String, ChainError> {
+    async fn build_release(&self, maintainer: &str, bounty_id: u64, winner: &str) -> Result<BuiltTx, ChainError> {
         let args = vec![scval::address(maintainer)?, scval::u64v(bounty_id), scval::address(winner)?];
         self.prepare(maintainer, "release", args).await
     }
 
-    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_refund(&self, maintainer: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.prepare(maintainer, "refund", vec![scval::address(maintainer)?, scval::u64v(bounty_id)]).await
     }
 
-    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<String, ChainError> {
+    async fn build_open_dispute(&self, arbiter: &str, bounty_id: u64) -> Result<BuiltTx, ChainError> {
         self.prepare(arbiter, "open_dispute", vec![scval::address(arbiter)?, scval::u64v(bounty_id)]).await
     }
 
-    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<String, ChainError> {
+    async fn build_resolve(&self, arbiter: &str, bounty_id: u64, winner: Option<&str>, winner_bps: u32) -> Result<BuiltTx, ChainError> {
         let args = vec![scval::address(arbiter)?, scval::u64v(bounty_id), scval::opt_address(winner)?, scval::u32v(winner_bps)];
         self.prepare(arbiter, "resolve", args).await
     }
@@ -284,4 +288,14 @@ impl TxBuilder for SorobanChain {
 /// Latest ledger sequence reached by a page (cursor-based), used by the indexer to track progress on quiet contracts.
 pub fn page_ledger(p: &EventsPage) -> u32 {
     cursor_ledger(&p.cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChainError;
+
+    #[test]
+    fn busy_error_is_transient() {
+        assert!(ChainError::Busy.is_transient());
+    }
 }

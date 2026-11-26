@@ -39,11 +39,7 @@ async fn join_all_local<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
                 }
             }
         }
-        if waiting {
-            Poll::Pending
-        } else {
-            Poll::Ready(outs.iter_mut().map(|o| o.take().expect("every release finished")).collect())
-        }
+        if waiting { Poll::Pending } else { Poll::Ready(outs.iter_mut().map(|o| o.take().expect("every release finished")).collect()) }
     })
     .await
 }

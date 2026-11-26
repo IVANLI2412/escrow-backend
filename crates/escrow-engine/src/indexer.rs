@@ -179,6 +179,7 @@ pub async fn apply_event(conn: &mut PgConnection, ev: &ChainEvent, meta: &EventM
             }
             bounties::apply_resolved(&mut *conn, id, meta.event_id, meta.tx_hash, winner.as_deref()).await?;
             disputes::mark_resolved(&mut *conn, id).await?;
+            disputes::promote_pending_resolutions_for_bounty(&mut *conn, id).await?;
         }
         ChainEvent::Funded { .. } => unreachable!("handled above"),
     }
@@ -252,6 +253,15 @@ pub async fn poll_once(d: &IndexerDeps) -> Result<PollReport, EngineError> {
                     jobs::enqueue_card_refresh(&mut *tx, bid).await?;
                     if matches!(ev, ChainEvent::Released { .. }) {
                         jobs::enqueue_payout_announcement(&mut *tx, bid).await?;
+                    }
+                    // The chain says a dispute was opened or resolved: tell the issue, once per event.
+                    let dispute_kind = match &ev {
+                        ChainEvent::Disputed { .. } => Some("disputed"),
+                        ChainEvent::Resolved { .. } => Some("resolved"),
+                        _ => None,
+                    };
+                    if let Some(kind) = dispute_kind {
+                        jobs::enqueue_dispute_comment(&mut *tx, bid, kind, None, meta.event_id).await?;
                     }
                 }
                 Outcome::Anomaly => {
